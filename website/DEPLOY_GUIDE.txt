@@ -18,7 +18,7 @@ A. Via GitHub:
    - Root Directory: Click "Edit" and select "website"
    - Framework Preset: Vite
    - Environment Variables: Add these two variables:
-       * VITE_SUPABASE_URL = https://fkhuybrvtkrdccqswzqr.supabase.co
+       * VITE_SUPABASE_URL = https://rbqjanevxnmllpvsssth.supabase.co
        * VITE_SUPABASE_ANON_KEY = (your Supabase anon key)
 4. Click "Deploy".
 *(Note: If you add environment variables after deploying, go to Deployments -> click '...' -> 'Redeploy' to rebuild with the variables).*

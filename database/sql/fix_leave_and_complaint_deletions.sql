@@ -1,6 +1,6 @@
 -- ==============================================================================
 -- Fix Leave Requests & Complaints Deletion Permissions and RLS Policies
--- Run this in your Supabase Project SQL Editor (https://supabase.com/dashboard/project/fkhuybrvtkrdccqswzqr/sql)
+-- Run this in your Supabase Project SQL Editor (https://supabase.com/dashboard/project/rbqjanevxnmllpvsssth/sql)
 -- ==============================================================================
 
 -- 1. Enable RLS on leave_requests table

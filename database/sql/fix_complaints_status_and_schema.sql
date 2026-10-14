@@ -1,7 +1,7 @@
 -- ==============================================================================
 -- Fix Complaints Status Check Constraint, Schema & Permissions
 -- Run this in your Supabase SQL Editor:
--- https://supabase.com/dashboard/project/fkhuybrvtkrdccqswzqr/sql
+-- https://supabase.com/dashboard/project/rbqjanevxnmllpvsssth/sql
 -- ==============================================================================
 
 -- 1. Ensure resolution column exists on complaints table
