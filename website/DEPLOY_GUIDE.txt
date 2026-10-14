@@ -11,11 +11,22 @@ NO Node.js server is needed to host the website—any static web hosting works!
 --------------------------------------------------------------------------------
 OPTION 1: VERCEL (RECOMMENDED - 1-CLICK FREE HOSTING)
 --------------------------------------------------------------------------------
-1. Install Vercel CLI (or connect your GitHub repository to vercel.com):
-   npm i -g vercel
-2. Inside the "website" directory, simply run:
-   vercel --prod
-3. Your website is instantly live with free HTTPS and global CDN!
+A. Via GitHub:
+1. Push this repository to your GitHub account.
+2. Go to https://vercel.com/new and import your repository.
+3. In Project Settings:
+   - Root Directory: Click "Edit" and select "website"
+   - Framework Preset: Vite
+   - Environment Variables: Add these two variables:
+       * VITE_SUPABASE_URL = https://fkhuybrvtkrdccqswzqr.supabase.co
+       * VITE_SUPABASE_ANON_KEY = (your Supabase anon key)
+4. Click "Deploy".
+*(Note: If you add environment variables after deploying, go to Deployments -> click '...' -> 'Redeploy' to rebuild with the variables).*
+
+B. Via Vercel CLI:
+1. Install Vercel CLI: npm i -g vercel
+2. Inside the "website" directory, run: vercel --prod
+3. If prompted to link existing project or settings, follow the CLI prompts.
 
 --------------------------------------------------------------------------------
 OPTION 2: NETLIFY (DRAG & DROP - 10 SECONDS)
