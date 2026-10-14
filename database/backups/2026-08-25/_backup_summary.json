@@ -1,0 +1,20 @@
+{
+  "backup_date": "2026-08-25",
+  "exported_at": "2026-08-25T13:34:57.834Z",
+  "total_tables": 12,
+  "total_records": 1788,
+  "tables": {
+    "profiles": 31,
+    "raw_attendance_logs": 1000,
+    "leave_requests": 64,
+    "complaints": 70,
+    "announcements": 4,
+    "notifications": 546,
+    "holidays": 5,
+    "employee_loans": 0,
+    "shift_timings": 4,
+    "trusted_devices": 50,
+    "device_settings": 1,
+    "purpose_transfers": 13
+  }
+}

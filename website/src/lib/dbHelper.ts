@@ -1,0 +1,3055 @@
+import { supabase, broadcastLiveNotification } from './supabase';
+import { sendPushNotificationToTargetUsers } from './firebase';
+import type { RawLog, LeaveRequest, EmployeeProfile, EmployeeNominee } from '../utils/attendanceProcessor';
+import { matchPin, calculateShiftDurationHours, isOffSaturday } from '../utils/attendanceProcessor';
+import {
+  withCache,
+  invalidateCache,
+  recordAuditChange,
+  initBackgroundSync
+} from './syncCacheManager';
+
+// Initialize offline background sync listener
+if (typeof window !== 'undefined') {
+  initBackgroundSync();
+}
+
+// Checks if the application is running in demo mode (Disabled for production)
+export function isDemoMode(): boolean {
+  return false;
+}
+
+// Fetch all active profiles from Supabase with ultra-fast memory & localStorage caching
+export async function getProfiles(): Promise<EmployeeProfile[]> {
+  return withCache('profiles', async () => {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('is_active', true);
+      
+    if (error) throw error;
+    return (data || []) as EmployeeProfile[];
+  });
+}
+
+// Fetch all left/inactive profiles from Supabase with caching
+export async function getLeftProfiles(): Promise<EmployeeProfile[]> {
+  return withCache('left_profiles', async () => {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('is_active', false);
+      
+    if (error) throw error;
+    return (data || []) as EmployeeProfile[];
+  });
+}
+
+// Fetch public profile info for calendar/birthday display without sensitive fields
+export async function getPublicProfiles(): Promise<Partial<EmployeeProfile>[]> {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('id, full_name, department, designation, date_of_birth')
+    .eq('is_active', true);
+    
+  if (error) throw error;
+  return data as Partial<EmployeeProfile>[];
+}
+
+// Fetch a single profile by user ID, email, or PIN using direct indexed queries
+export async function getProfileById(idOrEmail: string): Promise<EmployeeProfile> {
+  if (!idOrEmail) throw new Error('No profile identifier provided');
+  const cleanTarget = String(idOrEmail).trim();
+  const lowerTarget = cleanTarget.toLowerCase();
+
+  // 1. Direct lookup by UUID
+  if (cleanTarget.length > 20 && cleanTarget.includes('-')) {
+    try {
+      const { data: uuidMatch } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', cleanTarget)
+        .maybeSingle();
+      if (uuidMatch) return uuidMatch as EmployeeProfile;
+    } catch (e) {}
+  }
+
+  // 2. Direct lookup by email
+  if (lowerTarget.includes('@')) {
+    try {
+      const { data: emailMatch } = await supabase
+        .from('profiles')
+        .select('*')
+        .ilike('email', lowerTarget)
+        .maybeSingle();
+      if (emailMatch) return emailMatch as EmployeeProfile;
+    } catch (e) {}
+  }
+
+  // 3. Direct lookup by PIN
+  try {
+    const { data: pinMatch } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('pin', cleanTarget)
+      .maybeSingle();
+    if (pinMatch) return pinMatch as EmployeeProfile;
+  } catch (e) {}
+
+  // 4. Combined lookup if standard queries missed
+  try {
+    const { data: combinedMatch } = await supabase
+      .from('profiles')
+      .select('*')
+      .or(`pin.eq.${cleanTarget},email.ilike.${lowerTarget}`)
+      .maybeSingle();
+    if (combinedMatch) return combinedMatch as EmployeeProfile;
+  } catch (e) {}
+
+  throw new Error(`Profile not found for identifier: ${idOrEmail}`);
+}
+
+// Insert or update an employee profile in Supabase using the secure RPC function
+export async function saveProfile(
+  profile: Omit<EmployeeProfile, 'id'> & { id?: string },
+  email?: string,
+  password?: string
+): Promise<EmployeeProfile> {
+  // Capture previous state if updating an existing profile (enables one-click revert)
+  let prevProfile: any = null;
+  if (profile.id) {
+    try {
+      const { data } = await supabase.from('profiles').select('*').eq('id', profile.id).maybeSingle();
+      prevProfile = data;
+    } catch (e) {}
+  }
+
+  const { data: userId, error } = await supabase.rpc('save_employee_user', {
+    id_val: profile.id || null,
+    email_val: email || profile.email || '',
+    password_val: password || '',
+    pin_val: profile.pin,
+    name_val: profile.full_name,
+    designation_val: profile.designation || '',
+    department_val: profile.department || '',
+    salary_val: profile.base_salary,
+    hourly_val: profile.hourly_rate,
+    dob_val: profile.date_of_birth || null
+  });
+  
+  if (error) {
+    recordAuditChange({
+      action: profile.id ? 'update' : 'create',
+      entity: 'Employee',
+      targetId: profile.id || profile.pin,
+      targetName: profile.full_name || `PIN ${profile.pin}`,
+      userId: profile.id,
+      userPin: profile.pin,
+      userName: profile.full_name,
+      previousData: prevProfile,
+      newData: profile,
+      status: 'failed',
+      errorMessage: error.message,
+      table: 'profiles'
+    });
+    throw error;
+  }
+
+  // Direct update for extra columns to avoid changing RPC signature
+  const extraUpdates: any = {};
+  if (profile.role !== undefined) extraUpdates.role = profile.role;
+  if (profile.allowed_tabs !== undefined) extraUpdates.allowed_tabs = profile.allowed_tabs;
+  if (profile.income_tax !== undefined) extraUpdates.income_tax = profile.income_tax;
+  if (profile.nic_no !== undefined) extraUpdates.nic_no = profile.nic_no;
+  if (profile.emergency_contacts !== undefined) extraUpdates.emergency_contacts = profile.emergency_contacts;
+  if (profile.timeline_periods !== undefined) extraUpdates.timeline_periods = profile.timeline_periods;
+  if (profile.joining_date !== undefined) extraUpdates.joining_date = profile.joining_date;
+  if (profile.bank_name !== undefined) extraUpdates.bank_name = profile.bank_name;
+  if (profile.bank_account_title !== undefined) extraUpdates.bank_account_title = profile.bank_account_title;
+  if (profile.bank_account_no !== undefined) extraUpdates.bank_account_no = profile.bank_account_no;
+  if (profile.payment_method !== undefined) extraUpdates.payment_method = profile.payment_method;
+  if (profile.phone !== undefined) extraUpdates.phone = profile.phone;
+  if (password !== undefined && password !== '') extraUpdates.password = password;
+
+  if (Object.keys(extraUpdates).length > 0) {
+    try {
+      const { error: updateErr } = await supabase
+        .from('profiles')
+        .update(extraUpdates)
+        .eq('id', userId);
+      if (updateErr) {
+        // If column doesn't exist yet, retry without allowed_tabs to maintain robust saving
+        console.warn('Profile extraUpdates warning:', updateErr);
+        if (extraUpdates.allowed_tabs) {
+          delete extraUpdates.allowed_tabs;
+          await supabase.from('profiles').update(extraUpdates).eq('id', userId);
+        }
+      }
+    } catch (err) {
+      console.warn('Extra updates catch:', err);
+    }
+  }
+  
+  // Fetch the created/updated public profile record to return
+  const { data: newProfile, error: fetchError } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', userId)
+    .single();
+    
+  if (fetchError) throw fetchError;
+
+  // Invalidate profiles cache for immediate reactivity across the portal
+  invalidateCache('profiles');
+  invalidateCache('left_profiles');
+
+  // Log to audit history
+  recordAuditChange({
+    action: profile.id ? 'update' : 'create',
+    entity: 'Employee',
+    targetId: userId,
+    targetName: newProfile.full_name,
+    userId: userId,
+    userPin: newProfile.pin,
+    userName: newProfile.full_name,
+    previousData: prevProfile,
+    newData: newProfile,
+    status: 'saved',
+    table: 'profiles'
+  });
+
+  return newProfile as EmployeeProfile;
+}
+
+// Completely delete an employee profile and auth account from Supabase
+export async function deleteProfile(id: string): Promise<void> {
+  let prevProfile: any = null;
+  try {
+    const { data } = await supabase.from('profiles').select('*').eq('id', id).maybeSingle();
+    prevProfile = data;
+  } catch (e) {}
+
+  const { error } = await supabase.rpc('delete_employee_user', { user_id: id });
+  if (error) {
+    recordAuditChange({
+      action: 'delete',
+      entity: 'Employee',
+      targetId: id,
+      targetName: prevProfile?.full_name || `Employee ${id}`,
+      userId: id,
+      userPin: prevProfile?.pin,
+      userName: prevProfile?.full_name,
+      previousData: prevProfile,
+      status: 'failed',
+      errorMessage: error.message,
+      table: 'profiles'
+    });
+    throw error;
+  }
+
+  // Invalidate cache immediately
+  invalidateCache('profiles');
+  invalidateCache('left_profiles');
+
+  recordAuditChange({
+    action: 'delete',
+    entity: 'Employee',
+    targetId: id,
+    targetName: prevProfile?.full_name || `Employee ${id}`,
+    userId: id,
+    userPin: prevProfile?.pin,
+    userName: prevProfile?.full_name,
+    previousData: prevProfile,
+    status: 'saved',
+    table: 'profiles'
+  });
+}
+
+// Update an employee's active status (disabled when left)
+export async function setEmployeeActiveStatus(id: string, isActive: boolean): Promise<void> {
+  const { error } = await supabase
+    .from('profiles')
+    .update({ is_active: isActive })
+    .eq('id', id);
+  if (error) throw error;
+}
+
+// Mark an employee as left (disables account without deleting records)
+export async function markEmployeeAsLeft(id: string): Promise<void> {
+  await setEmployeeActiveStatus(id, false);
+}
+
+// Reactivate a left employee back to active workforce
+export async function reactivateEmployee(id: string): Promise<void> {
+  await setEmployeeActiveStatus(id, true);
+}
+
+// Update display order and department of multiple profiles for persistent drag-and-drop ordering
+export async function updateProfilesDisplayOrder(
+  updates: { id: string; display_order: number; department?: string }[]
+): Promise<void> {
+  if (!updates || updates.length === 0) return;
+
+  for (const item of updates) {
+    const patch: any = { display_order: item.display_order };
+    if (item.department !== undefined) {
+      patch.department = item.department;
+    }
+    await supabase.from('profiles').update(patch).eq('id', item.id);
+  }
+}
+
+// Synchronize an employee's consumed leave balance based on all Approved leave requests
+export async function syncEmployeeLeaveBalances(employeeId: string): Promise<any> {
+  let existingBal: any = null;
+  try {
+    const { data } = await supabase
+      .from('leave_balances')
+      .select('*')
+      .eq('employee_id', employeeId)
+      .maybeSingle();
+    existingBal = data;
+  } catch (e) { /* ignore read error */ }
+
+  let approvedLeaves: any[] = [];
+  try {
+    const { data } = await supabase
+      .from('leave_requests')
+      .select('*')
+      .eq('employee_id', employeeId)
+      .eq('status', 'Approved');
+    approvedLeaves = data || [];
+  } catch (e) { /* ignore */ }
+
+  let holidayDates: string[] = [];
+  try {
+    const { data: holidays } = await supabase
+      .from('holidays')
+      .select('date');
+    if (holidays) {
+      holidayDates = holidays.map((h: any) => h.date);
+    }
+  } catch (e) { /* ignore */ }
+
+  let casualUsed = 0;
+  let medicalUsed = 0;
+  let annualUsed = 0;
+
+  approvedLeaves.forEach((leave: any) => {
+    const start = new Date(leave.start_date + 'T00:00:00');
+    const end = new Date(leave.end_date + 'T00:00:00');
+    
+    let diffDays = 0;
+    const loop = new Date(start);
+    while (loop <= end) {
+      const pad = (n: number) => n.toString().padStart(2, '0');
+      const curStr = `${loop.getFullYear()}-${pad(loop.getMonth() + 1)}-${pad(loop.getDate())}`;
+      const dayOfWeek = loop.getDay();
+      const isSun = dayOfWeek === 0;
+      const offSat = isOffSaturday(loop);
+      const isHoliday = holidayDates.includes(curStr);
+      
+      if (!isSun && !offSat && !isHoliday) {
+        diffDays++;
+      }
+      loop.setDate(loop.getDate() + 1);
+    }
+
+    const type = leave.leave_type;
+    if (type === 'Casual') casualUsed += diffDays;
+    else if (type === 'Medical') medicalUsed += diffDays;
+    else if (type === 'Annual') annualUsed += diffDays;
+  });
+
+  const casualTotal = existingBal?.casual_total ?? 10;
+  const medicalTotal = existingBal?.medical_total ?? 10;
+  const annualTotal = existingBal?.annual_total ?? 10;
+
+  const payload = {
+    employee_id: employeeId,
+    casual_total: casualTotal,
+    casual_used: casualUsed,
+    medical_total: medicalTotal,
+    medical_used: medicalUsed,
+    annual_total: annualTotal,
+    annual_used: annualUsed
+  };
+
+  try {
+    await supabase
+      .from('leave_balances')
+      .upsert(payload, { onConflict: 'employee_id' });
+  } catch (e) { /* ignore upsert error */ }
+
+  return payload;
+}
+
+// Synchronize all active employees' leave balances
+export async function syncAllEmployeesLeaveBalances(): Promise<void> {
+  try {
+    const { data: profs } = await supabase.from('profiles').select('id').eq('is_active', true);
+    if (profs && profs.length > 0) {
+      await Promise.allSettled(profs.map(p => syncEmployeeLeaveBalances(p.id)));
+    }
+  } catch (e) {
+    console.warn('Could not sync all leave balances:', e);
+  }
+}
+
+// Update an employee's leave balance in Supabase
+export async function updateLeaveBalance(employeeId: string, balance: any): Promise<void> {
+  const payload = {
+    employee_id: employeeId,
+    casual_total: Number(balance.casual_total ?? 10),
+    casual_used: Number(balance.casual_used ?? 0),
+    medical_total: Number(balance.medical_total ?? 10),
+    medical_used: Number(balance.medical_used ?? 0),
+    annual_total: Number(balance.annual_total ?? 10),
+    annual_used: Number(balance.annual_used ?? 0)
+  };
+
+  const { error } = await supabase
+    .from('leave_balances')
+    .upsert(payload, { onConflict: 'employee_id' });
+
+  if (error) {
+    console.error('Failed to update leave balances in Supabase:', error);
+    throw error;
+  }
+}
+
+// Fetch leave balances from Supabase (auto-syncing if employeeId provided)
+export async function getLeaveBalances(employeeId?: string): Promise<any[]> {
+  try {
+    if (employeeId) {
+      // 1. READ-ONLY lookup first for employees
+      const { data, error } = await supabase
+        .from('leave_balances')
+        .select('*')
+        .eq('employee_id', employeeId)
+        .maybeSingle();
+
+      if (!error && data) {
+        return [data];
+      }
+
+      // 2. If row not found in DB, return computed in-memory payload excluding holidays & off days
+      let approvedLeaves: any[] = [];
+      try {
+        const { data: leaves } = await supabase
+          .from('leave_requests')
+          .select('*')
+          .eq('employee_id', employeeId)
+          .eq('status', 'Approved');
+        approvedLeaves = leaves || [];
+      } catch (e) {}
+
+      let holidayDates: string[] = [];
+      try {
+        const { data: holidays } = await supabase
+          .from('holidays')
+          .select('date');
+        if (holidays) {
+          holidayDates = holidays.map((h: any) => h.date);
+        }
+      } catch (e) {}
+
+      let casualUsed = 0;
+      let medicalUsed = 0;
+      let annualUsed = 0;
+
+      approvedLeaves.forEach((l: any) => {
+        const start = new Date(l.start_date + 'T00:00:00');
+        const end = new Date(l.end_date + 'T00:00:00');
+        let diffDays = 0;
+        const loop = new Date(start);
+        while (loop <= end) {
+          const pad = (n: number) => n.toString().padStart(2, '0');
+          const curStr = `${loop.getFullYear()}-${pad(loop.getMonth() + 1)}-${pad(loop.getDate())}`;
+          const dayOfWeek = loop.getDay();
+          const isSun = dayOfWeek === 0;
+          const offSat = isOffSaturday(loop);
+          const isHoliday = holidayDates.includes(curStr);
+
+          if (!isSun && !offSat && !isHoliday) {
+            diffDays++;
+          }
+          loop.setDate(loop.getDate() + 1);
+        }
+
+        if (l.leave_type === 'Casual') casualUsed += diffDays;
+        else if (l.leave_type === 'Medical') medicalUsed += diffDays;
+        else if (l.leave_type === 'Annual') annualUsed += diffDays;
+      });
+
+      return [{
+        employee_id: employeeId,
+        casual_total: 10, casual_used: casualUsed,
+        medical_total: 10, medical_used: medicalUsed,
+        annual_total: 10, annual_used: annualUsed
+      }];
+    }
+    const { data, error } = await supabase.from('leave_balances').select('*');
+    if (error) throw error;
+    return data || [];
+  } catch (err) {
+    if (employeeId) {
+      return [{
+        employee_id: employeeId,
+        casual_total: 10, casual_used: 0,
+        medical_total: 10, medical_used: 0,
+        annual_total: 10, annual_used: 0
+      }];
+    }
+    return [];
+  }
+}
+
+// Helper to split leave date range into primary and secondary chunks based on working days
+interface LeaveSplitChunk {
+  startDate: string;
+  endDate: string;
+  workingDays: number;
+}
+
+export function splitLeaveDateRange(
+  startDateStr: string,
+  endDateStr: string,
+  primaryDaysCount: number,
+  holidayDates: string[] = []
+): { primaryChunk: LeaveSplitChunk; secondaryChunk: LeaveSplitChunk | null } {
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  const start = new Date(startDateStr + 'T00:00:00');
+  const end = new Date(endDateStr + 'T00:00:00');
+
+  const workingDates: string[] = [];
+  const loop = new Date(start);
+
+  while (loop <= end) {
+    const curStr = `${loop.getFullYear()}-${pad(loop.getMonth() + 1)}-${pad(loop.getDate())}`;
+    const dayOfWeek = loop.getDay();
+    const isSun = dayOfWeek === 0;
+    const offSat = isOffSaturday(loop);
+    const isHoliday = holidayDates.includes(curStr);
+
+    if (!isSun && !offSat && !isHoliday) {
+      workingDates.push(curStr);
+    }
+    loop.setDate(loop.getDate() + 1);
+  }
+
+  const totalWorkingDays = workingDates.length;
+
+  if (primaryDaysCount >= totalWorkingDays || primaryDaysCount <= 0) {
+    return {
+      primaryChunk: { startDate: startDateStr, endDate: endDateStr, workingDays: totalWorkingDays },
+      secondaryChunk: null
+    };
+  }
+
+  const primaryStartDate = startDateStr;
+  const primaryEndDate = workingDates[primaryDaysCount - 1];
+
+  const secStartObj = new Date(primaryEndDate + 'T00:00:00');
+  secStartObj.setDate(secStartObj.getDate() + 1);
+  const secondaryStartDate = `${secStartObj.getFullYear()}-${pad(secStartObj.getMonth() + 1)}-${pad(secStartObj.getDate())}`;
+  const secondaryEndDate = endDateStr;
+
+  const secondaryWorkingDays = totalWorkingDays - primaryDaysCount;
+
+  return {
+    primaryChunk: {
+      startDate: primaryStartDate,
+      endDate: primaryEndDate,
+      workingDays: primaryDaysCount
+    },
+    secondaryChunk: {
+      startDate: secondaryStartDate,
+      endDate: secondaryEndDate,
+      workingDays: secondaryWorkingDays
+    }
+  };
+}
+
+// Approve and split a leave request across primary and secondary leave categories
+export async function approveAndSplitLeaveRequest(
+  requestId: number,
+  primaryType: 'Casual' | 'Medical' | 'Annual',
+  primaryDays: number,
+  secondaryType?: 'Casual' | 'Medical' | 'Annual',
+  holidayDates: string[] = []
+): Promise<void> {
+  const { data: req, error: fetchErr } = await supabase
+    .from('leave_requests')
+    .select('*')
+    .eq('id', requestId)
+    .single();
+
+  if (fetchErr || !req) throw fetchErr || new Error('Leave request not found');
+
+  const splitResult = splitLeaveDateRange(req.start_date, req.end_date, primaryDays, holidayDates);
+
+  // Update primary chunk
+  const { error: updateErr } = await supabase
+    .from('leave_requests')
+    .update({
+      start_date: splitResult.primaryChunk.startDate,
+      end_date: splitResult.primaryChunk.endDate,
+      leave_type: primaryType,
+      status: 'Approved'
+    })
+    .eq('id', requestId);
+
+  if (updateErr) throw updateErr;
+
+  // Insert secondary chunk if present
+  if (splitResult.secondaryChunk && secondaryType) {
+    const { error: insertErr } = await supabase
+      .from('leave_requests')
+      .insert({
+        employee_id: req.employee_id,
+        start_date: splitResult.secondaryChunk.startDate,
+        end_date: splitResult.secondaryChunk.endDate,
+        leave_type: secondaryType,
+        reason: req.reason ? `${req.reason} (Exceeding portion)` : 'Leave (Exceeding portion)',
+        status: 'Approved'
+      });
+
+    if (insertErr) throw insertErr;
+  }
+
+  await syncEmployeeLeaveBalances(req.employee_id);
+}
+
+// Fetch leave requests from Supabase with ultra-fast caching
+export async function getLeaveRequests(employeeId?: string): Promise<LeaveRequest[]> {
+  const cacheKey = employeeId ? `leave_requests_${employeeId}` : 'leave_requests_all';
+
+  return withCache(cacheKey, async () => {
+    const query = supabase.from('leave_requests').select('*');
+    let isUuid = false;
+
+    if (employeeId) {
+      const clean = String(employeeId).trim().toLowerCase();
+      if (clean.length > 20 && clean.includes('-')) {
+        query.eq('employee_id', clean);
+        isUuid = true;
+      }
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+    const rawList = (data as LeaveRequest[]) || [];
+
+    const allRequests = rawList.map(r => {
+      const rawTime = r.requested_at || r.created_at || (r as any).applied_at || (r as any).created_at || (r as any).requested_at;
+      return {
+        ...r,
+        requested_at: rawTime,
+        created_at: rawTime
+      };
+    }).sort((a, b) => new Date(b.requested_at || b.created_at || 0).getTime() - new Date(a.requested_at || a.created_at || 0).getTime());
+
+    if (employeeId && !isUuid) {
+      const clean = String(employeeId).trim().toLowerCase();
+      return allRequests.filter(r => 
+        r.employee_id && (
+          String(r.employee_id).trim().toLowerCase() === clean ||
+          matchPin(r.employee_id, clean)
+        )
+      );
+    }
+
+    return allRequests;
+  });
+}
+
+// Create a new leave request in Supabase
+export async function createLeaveRequest(request: Omit<LeaveRequest, 'id' | 'status'>): Promise<LeaveRequest> {
+  let targetEmployeeId = request.employee_id;
+
+  // If targetEmployeeId is not a valid UUID (e.g. is a PIN '1001' or email 'm.ashhar10@gmail.com'), lookup profile UUID from profiles table
+  if (targetEmployeeId && (!targetEmployeeId.includes('-') || targetEmployeeId.includes('@'))) {
+    try {
+      const prof = await getProfileById(targetEmployeeId);
+      if (prof?.id && String(prof.id).includes('-')) {
+        targetEmployeeId = prof.id;
+      }
+    } catch (e) {}
+  }
+
+  const nowIso = new Date().toISOString();
+  const payload: any = {
+    employee_id: targetEmployeeId,
+    start_date: request.start_date,
+    end_date: request.end_date,
+    leave_type: request.leave_type || 'Casual',
+    reason: request.reason || '',
+    status: 'Pending',
+    requested_at: nowIso
+  };
+
+  let { data, error } = await supabase
+    .from('leave_requests')
+    .insert(payload)
+    .select()
+    .single();
+  
+  if (error) {
+    // If schema cache mismatch error occurs, retry without requested_at timestamp field
+    delete payload.requested_at;
+    const retry = await supabase
+      .from('leave_requests')
+      .insert(payload)
+      .select()
+      .single();
+    data = retry.data;
+    error = retry.error;
+  }
+
+  if (error) {
+    recordAuditChange({
+      action: 'create',
+      entity: 'Leave',
+      targetId: 'pending_leave',
+      targetName: `${request.leave_type || 'Casual'} Leave (${request.start_date} to ${request.end_date})`,
+      userId: targetEmployeeId,
+      status: 'failed',
+      errorMessage: error.message,
+      table: 'leave_requests'
+    });
+    throw new Error(error.message || 'Failed to submit leave request to database');
+  }
+
+  const resultLeave = {
+    ...data,
+    created_at: data?.created_at || data?.requested_at || nowIso,
+    requested_at: data?.requested_at || data?.created_at || nowIso
+  } as LeaveRequest;
+
+  // Invalidate cache
+  invalidateCache('leave_requests_all');
+  if (targetEmployeeId) invalidateCache(`leave_requests_${targetEmployeeId}`);
+
+  let empName = 'Employee';
+  let empPin = '';
+  try {
+    const prof = await getProfileById(targetEmployeeId);
+    if (prof) {
+      empName = prof.full_name || prof.email || 'Employee';
+      empPin = prof.pin ? ` (PIN: ${prof.pin})` : '';
+    }
+  } catch (e) {}
+
+  // Log to audit history
+  recordAuditChange({
+    action: 'create',
+    entity: 'Leave',
+    targetId: resultLeave.id,
+    targetName: `${empName} - ${request.leave_type || 'Casual'} Leave (${request.start_date})`,
+    userId: targetEmployeeId,
+    userPin: empPin.replace(/[^\d]/g, ''),
+    userName: empName,
+    newData: resultLeave,
+    status: 'saved',
+    table: 'leave_requests'
+  });
+
+  try {
+    await createNotification({
+      user_id: 'admin',
+      title: `New Leave Request - ${empName}`,
+      message: `${empName}${empPin} submitted a ${request.leave_type || 'Casual'} leave request for ${request.start_date} to ${request.end_date}. Reason: "${request.reason || 'Not specified'}"`
+    });
+  } catch (e) {}
+
+  return resultLeave;
+}
+
+// Approve or reject a leave request and adjust balances accordingly
+export async function updateLeaveRequestStatus(
+  requestId: number, 
+  status: 'Approved' | 'Rejected' | 'Pending', 
+  newLeaveType?: 'Casual' | 'Medical' | 'Annual'
+): Promise<void> {
+  let prevLeave: any = null;
+  try {
+    const { data } = await supabase.from('leave_requests').select('*').eq('id', requestId).maybeSingle();
+    prevLeave = data;
+  } catch (e) {}
+
+  const updatePayload: any = { status };
+  if (newLeaveType) {
+    updatePayload.leave_type = newLeaveType;
+  }
+
+  const { data: leave, error: getError } = await supabase
+    .from('leave_requests')
+    .update(updatePayload)
+    .eq('id', requestId)
+    .select()
+    .single();
+
+  if (getError) {
+    recordAuditChange({
+      action: 'update',
+      entity: 'Leave',
+      targetId: requestId,
+      targetName: `Leave #${requestId} Status: ${status}`,
+      previousData: prevLeave,
+      newData: { status, ...newLeaveType ? { leave_type: newLeaveType } : {} },
+      status: 'failed',
+      errorMessage: getError.message,
+      table: 'leave_requests'
+    });
+    throw getError;
+  }
+
+  // Invalidate caches
+  invalidateCache('leave_requests_all');
+  if (leave?.employee_id) invalidateCache(`leave_requests_${leave.employee_id}`);
+
+  // Log audit change
+  recordAuditChange({
+    action: 'update',
+    entity: 'Leave',
+    targetId: requestId,
+    targetName: `Leave #${requestId} -> ${status}`,
+    userId: leave?.employee_id,
+    previousData: prevLeave,
+    newData: leave,
+    status: 'saved',
+    table: 'leave_requests'
+  });
+
+  if (leave && leave.employee_id) {
+    await syncEmployeeLeaveBalances(leave.employee_id);
+  }
+}
+
+// Delete a leave request
+export async function deleteLeaveRequest(requestId: number): Promise<void> {
+  let empId: string | undefined = undefined;
+  let prevLeave: any = null;
+  try {
+    const { data: leave } = await supabase
+      .from('leave_requests')
+      .select('*')
+      .eq('id', requestId)
+      .maybeSingle();
+    if (leave) {
+      empId = leave.employee_id;
+      prevLeave = leave;
+    }
+  } catch (e) {}
+
+  // 1. Try Security Definer RPC (Bypasses RLS for guaranteed deletion across all clients)
+  try {
+    await supabase.rpc('delete_pending_leave_request', { p_id: requestId });
+  } catch (rpcErr) {}
+
+  // 2. Direct Delete fallback
+  try {
+    await supabase
+      .from('leave_requests')
+      .delete()
+      .eq('id', requestId);
+  } catch (e) {}
+
+  // Invalidate caches
+  invalidateCache('leave_requests_all');
+  if (empId) invalidateCache(`leave_requests_${empId}`);
+
+  // Record audit log
+  recordAuditChange({
+    action: 'delete',
+    entity: 'Leave',
+    targetId: requestId,
+    targetName: `Leave #${requestId} (${prevLeave?.leave_type || 'Request'})`,
+    userId: empId,
+    previousData: prevLeave,
+    status: 'saved',
+    table: 'leave_requests'
+  });
+
+  if (empId) {
+    try {
+      await syncEmployeeLeaveBalances(empId);
+    } catch (e) {}
+  }
+
+  // 3. Trigger live UI refresh so Admin and Employee panels update immediately
+  try {
+    window.dispatchEvent(new CustomEvent('app-refresh-notifications'));
+  } catch (e) {}
+}
+
+// Fetch raw logs from Supabase (with optional server-side filtering for PIN, startDate, and endDate)
+export async function getRawLogs(employeePin?: string, startDate?: string, endDate?: string): Promise<RawLog[]> {
+  let allLogs: RawLog[] = [];
+  let from = 0;
+  const step = 1000;
+  let hasMore = true;
+
+  while (hasMore) {
+    let query = supabase
+      .from('raw_attendance_logs')
+      .select('*')
+      .order('timestamp', { ascending: false })
+      .range(from, from + step - 1);
+
+    if (employeePin && employeePin.trim()) {
+      const pinStr = employeePin.trim();
+      const numPin = parseInt(pinStr, 10);
+      if (!isNaN(numPin)) {
+        // match both pinStr and unpadded/padded if applicable e.g. "17", "017", "0017"
+        const unpadded = String(numPin);
+        const padded2 = unpadded.padStart(2, '0');
+        const padded3 = unpadded.padStart(3, '0');
+        const padded4 = unpadded.padStart(4, '0');
+        const pinSet = Array.from(new Set([pinStr, unpadded, padded2, padded3, padded4]));
+        query = query.in('employee_pin', pinSet);
+      } else {
+        query = query.eq('employee_pin', pinStr);
+      }
+    }
+
+    if (startDate && startDate.trim()) {
+      const s = startDate.trim();
+      query = query.gte('timestamp', s.includes('T') ? s : `${s}T00:00:00.000Z`);
+    }
+
+    if (endDate && endDate.trim()) {
+      const e = endDate.trim();
+      query = query.lte('timestamp', e.includes('T') ? e : `${e}T23:59:59.999Z`);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    if (data && data.length > 0) {
+      allLogs = allLogs.concat(data as RawLog[]);
+      if (data.length < step) {
+        hasMore = false;
+      } else {
+        from += step;
+      }
+    } else {
+      hasMore = false;
+    }
+  }
+
+  if (employeePin) {
+    return allLogs.filter(l => matchPin(l.employee_pin, employeePin));
+  }
+
+  return allLogs;
+}
+
+// Upload raw logs into Supabase (ignoring duplicate pin+timestamp entries)
+export async function uploadRawLogs(logs: RawLog[]): Promise<void> {
+  const { error } = await supabase
+    .from('raw_attendance_logs')
+    .upsert(logs, {
+      onConflict: 'employee_pin,timestamp',
+      ignoreDuplicates: true
+    });
+    
+  if (error) throw error;
+}
+
+export interface ShiftTiming {
+  id?: number;
+  target_type: 'designation' | 'department' | 'employee' | 'global_default';
+  target_id: string;
+  target_name: string;
+  start_time: string;
+  end_time: string;
+  grace_mins?: number;
+  days: string[];
+  is_fixed_hours?: boolean;
+  total_hours?: number;
+  saturday_option?: 'alternate' | 'all_off' | 'all_working';
+  allow_regular_overtime?: boolean;
+  created_at?: string;
+}
+
+// Fetch departments
+export async function getDepartments(): Promise<string[]> {
+  const { data, error } = await supabase
+    .from('departments')
+    .select('name')
+    .order('name', { ascending: true });
+    
+  if (error) throw error;
+  return (data || []).map((d: any) => d.name);
+}
+
+// Add department
+export async function addDepartment(name: string): Promise<string> {
+  const { data, error } = await supabase
+    .from('departments')
+    .insert({ name })
+    .select('name')
+    .single();
+    
+  if (error) throw error;
+  return data.name;
+}
+
+// Fetch designations
+export async function getDesignations(): Promise<string[]> {
+  const { data, error } = await supabase
+    .from('designations')
+    .select('name')
+    .order('name', { ascending: true });
+    
+  if (error) throw error;
+  return (data || []).map((d: any) => d.name);
+}
+
+// Add designation
+export async function addDesignation(name: string): Promise<string> {
+  const { data, error } = await supabase
+    .from('designations')
+    .insert({ name })
+    .select('name')
+    .single();
+    
+  if (error) throw error;
+  return data.name;
+}
+
+const SHIFT_TIMINGS_BACKUP_KEY = 'elipse_shift_timings_backup_v1';
+
+export function getLocalShiftTimingsBackup(): Record<string, Partial<ShiftTiming>> {
+  try {
+    const str = localStorage.getItem(SHIFT_TIMINGS_BACKUP_KEY);
+    return str ? JSON.parse(str) : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+export function setLocalShiftTimingBackup(rule: ShiftTiming) {
+  try {
+    const backup = getLocalShiftTimingsBackup();
+    const key = rule.id ? `id_${rule.id}` : `${rule.target_type}_${rule.target_id}`;
+    backup[key] = rule;
+    localStorage.setItem(SHIFT_TIMINGS_BACKUP_KEY, JSON.stringify(backup));
+  } catch (e) {}
+}
+
+// Fetch Shift Timings with ultra-fast caching
+export async function getShiftTimings(): Promise<ShiftTiming[]> {
+  return withCache('shift_timings', async () => {
+    let list: ShiftTiming[] = [];
+    try {
+      const { data, error } = await supabase
+        .from('shift_timings')
+        .select('*')
+        .order('created_at', { ascending: false });
+      if (!error && data) {
+        list = (data as any[]).map(t => {
+          const startStr = String(t.start_time || '');
+          const endStr = String(t.end_time || '');
+          const startParts = startStr.split(':');
+          const endParts = endStr.split(':');
+          const startSecs = startParts[2] ? parseInt(startParts[2], 10) : 0;
+          const endMins = endParts[1] ? parseInt(endParts[1], 10) : 0;
+          const startMins = startParts[1] ? parseInt(startParts[1], 10) : 0;
+          
+          let isFix = t.is_fixed_hours;
+          let totHrs = undefined;
+
+          const tagMatch = String(t.target_name || '').match(/\[FIXED_HOURS:(\d+(?:\.\d+)?)\]/i);
+          if (tagMatch) {
+            isFix = true;
+            totHrs = parseFloat(tagMatch[1]);
+          }
+
+          if (isFix === undefined || isFix === null) {
+            isFix = startStr === endStr || (startStr.startsWith('09:00') && endStr.startsWith('09:')) || (startSecs > 0 && startSecs <= 24);
+          }
+
+          if (totHrs === undefined) {
+            if (isFix) {
+              if (endStr.startsWith('09:') && endMins > 0 && endMins <= 24 && startMins === 0) {
+                totHrs = endMins;
+              } else if (startSecs > 0 && startSecs <= 24) {
+                totHrs = startSecs;
+              } else if (t.total_hours && Number(t.total_hours) > 0) {
+                totHrs = Number(t.total_hours);
+              } else {
+                totHrs = 9;
+              }
+            } else {
+              totHrs = (t.total_hours && Number(t.total_hours) > 0) ? Number(t.total_hours) : calculateShiftDurationHours(t.start_time, t.end_time);
+            }
+          }
+
+          return {
+            ...t,
+            is_fixed_hours: !!isFix,
+            allow_regular_overtime: t.allow_regular_overtime === true,
+            total_hours: Number(totHrs) || 9,
+            // Keep raw start_time/end_time so resolveTotalHours can decode encoded hours from them
+            start_time: t.start_time || '09:00:00',
+            end_time: t.end_time || '18:00:00'
+          };
+        });
+      }
+    } catch (e) {}
+
+    // Merge with local backup as additional layer
+    const backup = getLocalShiftTimingsBackup();
+    list = list.map(t => {
+      const keyId = t.id ? `id_${t.id}` : '';
+      const keyTarget = `${t.target_type}_${t.target_id}`;
+      const saved = backup[keyId] || backup[keyTarget];
+      if (saved) {
+        return {
+          ...t,
+          is_fixed_hours: saved.is_fixed_hours !== undefined ? saved.is_fixed_hours : t.is_fixed_hours,
+          allow_regular_overtime: saved.allow_regular_overtime !== undefined ? saved.allow_regular_overtime : t.allow_regular_overtime,
+          total_hours: saved.total_hours !== undefined ? saved.total_hours : t.total_hours,
+          grace_mins: saved.grace_mins !== undefined ? saved.grace_mins : t.grace_mins,
+          saturday_option: saved.saturday_option !== undefined ? saved.saturday_option : t.saturday_option,
+        };
+      }
+      return t;
+    });
+
+    return list.filter(t => t.target_id !== 'GLOBAL_DEFAULT_SETTINGS');
+  });
+}
+
+// Save Shift Timing (Create/Update)
+export async function saveShiftTiming(timing: ShiftTiming): Promise<ShiftTiming> {
+  setLocalShiftTimingBackup(timing);
+
+  const startVal = timing.start_time || '09:00:00';
+  const endVal = timing.end_time || '18:00:00';
+
+  // Clean payload matching base table schema
+  const cleanPayload: any = {
+    target_type: timing.target_type,
+    target_id: timing.target_id,
+    target_name: timing.target_name,
+    start_time: startVal,
+    end_time: endVal,
+    days: timing.days,
+    is_fixed_hours: timing.is_fixed_hours,
+    total_hours: timing.total_hours || 9,
+    saturday_option: timing.saturday_option,
+    grace_mins: timing.grace_mins,
+    allow_regular_overtime: timing.allow_regular_overtime === true
+  };
+  if (timing.id) {
+    cleanPayload.id = timing.id;
+  }
+
+  let resultTiming: ShiftTiming = timing;
+
+  try {
+    const { data, error } = await supabase
+      .from('shift_timings')
+      .upsert(cleanPayload)
+      .select()
+      .maybeSingle();
+
+    if (!error && data) {
+      resultTiming = { ...data, ...timing } as ShiftTiming;
+      setLocalShiftTimingBackup(resultTiming);
+    } else if (error) {
+      // Fallback for missing optional DB columns
+      const fallbackPayload: any = {
+        target_type: timing.target_type,
+        target_id: timing.target_id,
+        target_name: timing.target_name,
+        start_time: startVal,
+        end_time: endVal,
+        days: timing.days
+      };
+      if (timing.id) fallbackPayload.id = timing.id;
+      const { data: fbData } = await supabase.from('shift_timings').upsert(fallbackPayload).select().maybeSingle();
+      if (fbData) {
+        resultTiming = { ...fbData, ...timing } as ShiftTiming;
+        setLocalShiftTimingBackup(resultTiming);
+      }
+    }
+  } catch (e) {}
+
+  // Invalidate cache immediately
+  invalidateCache('shift_timings');
+
+  // Record audit entry
+  recordAuditChange({
+    action: timing.id ? 'update' : 'create',
+    entity: 'Shift Timing',
+    targetId: resultTiming.id || resultTiming.target_id,
+    targetName: `${resultTiming.target_name} (${resultTiming.target_type})`,
+    newData: resultTiming,
+    status: 'saved',
+    table: 'shift_timings'
+  });
+
+  return resultTiming;
+}
+
+// Delete Shift Timing
+export async function deleteShiftTiming(id: number): Promise<void> {
+  const { error } = await supabase
+    .from('shift_timings')
+    .delete()
+    .eq('id', id);
+    
+  if (error) {
+    recordAuditChange({
+      action: 'delete',
+      entity: 'Shift Timing',
+      targetId: id,
+      targetName: `Shift Timing #${id}`,
+      status: 'failed',
+      errorMessage: error.message,
+      table: 'shift_timings'
+    });
+    throw error;
+  }
+
+  invalidateCache('shift_timings');
+
+  recordAuditChange({
+    action: 'delete',
+    entity: 'Shift Timing',
+    targetId: id,
+    targetName: `Shift Timing #${id}`,
+    status: 'saved',
+    table: 'shift_timings'
+  });
+}
+
+// --- NEW HELPDESK, ANNOUNCEMENTS, AND NOTIFICATIONS CENTER HELPERS ---
+
+export interface Complaint {
+  id?: number;
+  employee_id: string;
+  title: string;
+  description: string;
+  status: 'Open' | 'In Progress' | 'Resolved' | 'Ignored' | 'Rejected' | 'Approved' | 'Closed';
+  resolution?: string;
+  admin_response?: string;
+  created_at?: string;
+}
+
+export interface Announcement {
+  id?: number;
+  title: string;
+  message: string;
+  target_type: 'all' | 'department' | 'designation' | 'employee';
+  target_value?: string;
+  color?: string;
+  status?: 'Active' | 'Scheduled' | 'Disposed';
+  schedule_from?: string | null;
+  dispose_at?: string | null;
+  created_at?: string;
+}
+
+export interface Notification {
+  id?: number;
+  user_id: string | null;
+  title: string;
+  message: string;
+  is_read: boolean;
+  created_at?: string;
+}
+
+// Fetch complaints from Supabase (excludes loan request entries)
+export async function getComplaints(employeeId?: string): Promise<Complaint[]> {
+  let query = supabase.from('complaints').select('*').order('created_at', { ascending: false });
+  const { data, error } = await query;
+  if (error) throw error;
+  const list = (data || []) as Complaint[];
+  // Filter out loan request entries — they belong in the Loans panel, not Help Desk
+  const filtered = list.filter(c => !c.title?.includes('[LOAN_REQUEST]'));
+  if (employeeId) {
+    return filtered.filter(c => matchPin(c.employee_id, employeeId));
+  }
+  return filtered;
+}
+
+// Create a complaint
+export async function createComplaint(complaint: Omit<Complaint, 'id' | 'status'>): Promise<Complaint> {
+  const { data, error } = await supabase
+    .from('complaints')
+    .insert({
+      ...complaint,
+      status: 'Open'
+    })
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data as Complaint;
+}
+
+// Update a complaint status or resolution
+export async function updateComplaintStatus(id: number, status: Complaint['status'], resolution?: string): Promise<Complaint> {
+  const updateData: Partial<Complaint> = { status };
+  if (resolution !== undefined) {
+    updateData.resolution = resolution;
+  }
+  
+  // 1. Try direct Supabase update
+  let directError: any = null;
+  try {
+    const { data, error } = await supabase
+      .from('complaints')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (!error && data) {
+      return data as Complaint;
+    }
+    directError = error;
+  } catch (err) {
+    directError = err;
+  }
+
+  // 2. RPC fallback for guaranteed update & RLS bypass
+  try {
+    const { data: rpcData, error: rpcErr } = await supabase.rpc('update_complaint_status', {
+      p_id: id,
+      p_status: status,
+      p_resolution: resolution || null
+    });
+    if (!rpcErr && rpcData) {
+      return rpcData as Complaint;
+    }
+    if (rpcErr) {
+      throw rpcErr;
+    }
+  } catch (rpcCatchErr) {
+    // If RPC fails too, throw original direct error or RPC error
+    throw directError || rpcCatchErr;
+  }
+
+  throw directError || new Error('Failed to update complaint status');
+}
+
+// Delete a complaint
+export async function deleteComplaint(id: number): Promise<void> {
+  // 1. Try Security Definer RPC
+  try {
+    await supabase.rpc('delete_open_complaint', { p_id: id });
+  } catch (rpcErr) {}
+
+  // 2. Direct Delete fallback
+  try {
+    await supabase
+      .from('complaints')
+      .delete()
+      .eq('id', id);
+  } catch (e) {}
+
+  // 3. Broadcast sync event for table refresh
+  try {
+    window.dispatchEvent(new CustomEvent('app-refresh-notifications'));
+  } catch (e) {}
+}
+
+export interface ApprovedCorrection {
+  id?: number;
+  employee_id: string;
+  employee_pin: string;
+  date: string;
+  check_in?: string | null;
+  check_out?: string | null;
+  status?: string;
+  created_at?: string;
+}
+
+// Fetch approved attendance corrections (with graceful fallback to localStorage)
+export async function getApprovedAttendanceCorrections(employeeId?: string): Promise<ApprovedCorrection[]> {
+  let allCorrs: ApprovedCorrection[] = [];
+  try {
+    const { data, error } = await supabase
+      .from('approved_attendance_corrections')
+      .select('*');
+    if (!error && data) {
+      allCorrs = data as ApprovedCorrection[];
+    }
+  } catch (e) {
+    /* fallback to localStorage */
+  }
+
+  try {
+    const raw = localStorage.getItem('approved_attendance_corrections');
+    if (raw) {
+      const parsed: ApprovedCorrection[] = JSON.parse(raw);
+      parsed.forEach(c => {
+        if (!allCorrs.some(x => x.employee_id === c.employee_id && x.date === c.date)) {
+          allCorrs.push(c);
+        }
+      });
+    }
+  } catch (e) {}
+
+  if (employeeId) {
+    return allCorrs.filter(c => matchPin(c.employee_id, employeeId) || matchPin(c.employee_pin, employeeId));
+  }
+
+  return allCorrs;
+}
+
+// Save or update an approved attendance correction
+export async function saveApprovedAttendanceCorrection(corr: ApprovedCorrection): Promise<void> {
+  // 1. Try to upsert into Supabase table
+  try {
+    await supabase
+      .from('approved_attendance_corrections')
+      .upsert({
+        employee_id: corr.employee_id,
+        employee_pin: corr.employee_pin,
+        date: corr.date,
+        check_in: corr.check_in || null,
+        check_out: corr.check_out || null,
+        status: corr.status || 'Approved'
+      }, {
+        onConflict: 'employee_id,date'
+      });
+  } catch (e) {
+    /* fallback */
+  }
+
+  // 2. Also persist in localStorage for multi-layer local caching
+  try {
+    const raw = localStorage.getItem('approved_attendance_corrections');
+    let list: ApprovedCorrection[] = raw ? JSON.parse(raw) : [];
+    list = list.filter(item => !(item.employee_id === corr.employee_id && item.date === corr.date));
+    list.push(corr);
+    localStorage.setItem('approved_attendance_corrections', JSON.stringify(list));
+  } catch (e) {}
+}
+
+// Delete an approved attendance correction
+export async function deleteApprovedAttendanceCorrection(employeeId: string, date: string, employeePin?: string): Promise<void> {
+  // 1. Delete from Supabase approved_attendance_corrections table
+  try {
+    const cleanId = String(employeeId || '').trim();
+    const cleanPin = String(employeePin || '').trim();
+    
+    if (cleanId) {
+      await supabase
+        .from('approved_attendance_corrections')
+        .delete()
+        .eq('date', date)
+        .eq('employee_id', cleanId);
+    }
+    if (cleanPin) {
+      await supabase
+        .from('approved_attendance_corrections')
+        .delete()
+        .eq('date', date)
+        .eq('employee_pin', cleanPin);
+    }
+  } catch (e) {}
+
+  // 2. Also remove from localStorage cache
+  try {
+    const raw = localStorage.getItem('approved_attendance_corrections');
+    if (raw) {
+      let list: ApprovedCorrection[] = JSON.parse(raw);
+      list = list.filter(item => {
+        const matchDate = item.date === date;
+        const matchEmp = item.employee_id === employeeId || 
+                         item.employee_pin === employeeId || 
+                         (employeePin && (item.employee_id === employeePin || item.employee_pin === employeePin));
+        return !(matchDate && matchEmp);
+      });
+      localStorage.setItem('approved_attendance_corrections', JSON.stringify(list));
+    }
+  } catch (e) {}
+}
+
+// Fetch announcements
+export async function getAnnouncements(): Promise<Announcement[]> {
+  const { data, error } = await supabase
+    .from('announcements')
+    .select('*')
+    .order('created_at', { ascending: false });
+
+  if (error) throw error;
+  return data as Announcement[];
+}
+
+// Create an announcement
+export async function createAnnouncement(announcement: Announcement): Promise<Announcement> {
+  const { data, error } = await supabase
+    .from('announcements')
+    .insert(announcement)
+    .select()
+    .single();
+
+  if (error) {
+    // If column error due to unmigrated schema, fallback to inserting core columns
+    const { status, schedule_from, dispose_at, ...coreAnnouncement } = announcement;
+    const { data: fallbackData, error: fallbackError } = await supabase
+      .from('announcements')
+      .insert(coreAnnouncement)
+      .select()
+      .single();
+    if (fallbackError) throw fallbackError;
+    return fallbackData as Announcement;
+  }
+  return data as Announcement;
+}
+
+// Update announcement
+export async function updateAnnouncement(id: number, updates: Partial<Announcement>): Promise<Announcement> {
+  const { data, error } = await supabase
+    .from('announcements')
+    .update(updates)
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error) {
+    const { status, schedule_from, dispose_at, ...coreUpdates } = updates;
+    const { data: fallbackData, error: fallbackError } = await supabase
+      .from('announcements')
+      .update(coreUpdates)
+      .eq('id', id)
+      .select()
+      .single();
+    if (fallbackError) throw fallbackError;
+    return fallbackData as Announcement;
+  }
+  return data as Announcement;
+}
+
+// Dispose announcement (hide without deleting)
+export async function disposeAnnouncement(id: number): Promise<void> {
+  await updateAnnouncement(id, { 
+    status: 'Disposed',
+    dispose_at: new Date().toISOString()
+  });
+}
+
+// Reactivate a disposed announcement
+export async function reactivateAnnouncement(id: number): Promise<void> {
+  await updateAnnouncement(id, {
+    status: 'Active',
+    dispose_at: null
+  });
+}
+
+// Delete announcement permanently
+export async function deleteAnnouncement(id: number): Promise<void> {
+  const { error } = await supabase
+    .from('announcements')
+    .delete()
+    .eq('id', id);
+
+  if (error) throw error;
+}
+
+// Fetch notifications
+export async function getNotifications(
+  userId: string, 
+  isAdmin: boolean = false,
+  userPin?: string,
+  userEmail?: string,
+  userDesignation?: string,
+  userDepartment?: string,
+  userName?: string
+): Promise<Notification[]> {
+  try {
+    const { data, error } = await supabase
+      .from('notifications')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error || !data) return [];
+
+    const allNotifs = data as Notification[];
+
+    if (isAdmin) {
+      // Admin sees ALL notifications from everywhere across the whole portal
+      return allNotifs;
+    }
+
+    const cleanId = String(userId || '').trim().toLowerCase();
+    const cleanPin = String(userPin || '').trim().toLowerCase();
+    const cleanEmail = String(userEmail || '').trim().toLowerCase();
+    const cleanDesig = String(userDesignation || '').trim().toLowerCase();
+    const cleanDept = String(userDepartment || '').trim().toLowerCase();
+    const cleanName = String(userName || '').trim().toLowerCase();
+
+    // Isolated filtering for regular employees: ONLY see notifications targeted to THIS employee!
+    return allNotifs.filter(n => {
+      const targetUser = String(n.user_id || '').trim().toLowerCase();
+      
+      // 1. Exclude all admin-targeted notifications
+      if (targetUser === 'admin' || targetUser === 'administrator') return false;
+
+      // 2. Exclude employee-to-admin request/submission notifications
+      const titleLower = String(n.title || '').toLowerCase();
+      const msgLower = String(n.message || '').toLowerCase();
+      const isEmployeeToAdminSubmission = 
+        titleLower.includes('new leave request') ||
+        titleLower.includes('attendance correction') ||
+        titleLower.includes('helpdesk:') ||
+        titleLower.includes('new loan request') ||
+        titleLower.includes('password changed') ||
+        msgLower.includes('submitted a leave request') ||
+        msgLower.includes('requested correction') ||
+        msgLower.includes('submitted a complaint') ||
+        msgLower.includes('submitted "');
+
+      if (isEmployeeToAdminSubmission) {
+        return false;
+      }
+
+      // 3. Direct match by UUID, PIN, Email, or Name for this logged in employee
+      if (
+        (cleanId && targetUser === cleanId) ||
+        (cleanPin && targetUser === cleanPin) ||
+        (cleanEmail && targetUser === cleanEmail) ||
+        (cleanName && targetUser === cleanName)
+      ) {
+        return true;
+      }
+
+      // 4. Department or Designation matching
+      if (cleanDept && targetUser === cleanDept) return true;
+      if (cleanDesig && targetUser === cleanDesig) return true;
+
+      // 5. If targetUser is explicitly set to someone else, reject
+      if (targetUser && targetUser !== 'all' && targetUser !== 'null') {
+        return false;
+      }
+
+      // 6. Global broadcast notification for all employees (e.g. Announcements, Holidays, Wishes)
+      if (!n.user_id || targetUser === 'all' || targetUser === 'null') {
+        if (cleanPin && msgLower.includes('pin:') && !msgLower.includes(`pin: ${cleanPin}`)) {
+          return false;
+        }
+        return true;
+      }
+
+      return false;
+    });
+  } catch (err) {
+    return [];
+  }
+}
+
+// Create a notification (supports 'admin', UUIDs, PINs, or global broadcast)
+export async function createNotification(notification: Omit<Notification, 'id' | 'is_read'>): Promise<Notification> {
+  let data: any = null;
+  try {
+    const rawTarget = notification.user_id !== undefined && notification.user_id !== null ? String(notification.user_id).trim() : null;
+    const dbUserId = rawTarget === '' ? null : rawTarget;
+    const res = await supabase
+      .from('notifications')
+      .insert({
+        title: notification.title,
+        message: notification.message,
+        user_id: dbUserId,
+        is_read: false
+      })
+      .select()
+      .maybeSingle();
+    data = res.data;
+  } catch (e) {}
+
+  const finalNotif = data || {
+    id: Date.now(),
+    ...notification,
+    is_read: false,
+    created_at: new Date().toISOString()
+  };
+
+  const isMuted = localStorage.getItem('is_notifications_muted') === 'true';
+
+  if (!isMuted) {
+    // Dispatch WebPush & FCM Push Wake-up signal to recipient devices (wakes closed apps on Android/iOS/Desktop)
+    try {
+      sendPushNotificationToTargetUsers(notification.user_id, notification.title, notification.message).catch(() => {});
+    } catch (pushErr) {}
+
+    // Instant Peer-to-Peer WebSocket Broadcast (0ms latency across all active clients)
+    broadcastLiveNotification({
+      id: finalNotif.id,
+      user_id: notification.user_id,
+      title: notification.title,
+      message: notification.message
+    }).catch(() => {});
+
+    // Dispatch local window event so current window reacts immediately with zero lag
+    try {
+      window.dispatchEvent(new CustomEvent('app-local-notification', { detail: finalNotif }));
+    } catch (wErr) {}
+  }
+
+  return finalNotif as Notification;
+}
+
+// Mark single notification read
+export async function markNotificationRead(id: number): Promise<void> {
+  const { error } = await supabase
+    .from('notifications')
+    .update({ is_read: true })
+    .eq('id', id);
+
+  if (error) throw error;
+}
+
+// Mark all notifications read for a user
+export async function markAllNotificationsRead(userId: string, isAdmin?: boolean, specificIds?: number[]): Promise<void> {
+  if (specificIds && specificIds.length > 0) {
+    await supabase
+      .from('notifications')
+      .update({ is_read: true })
+      .in('id', specificIds);
+    return;
+  }
+
+  if (isAdmin) {
+    await supabase
+      .from('notifications')
+      .update({ is_read: true })
+      .or(`user_id.eq.admin,user_id.eq.${userId},user_id.is.null`);
+  } else {
+    await supabase
+      .from('notifications')
+      .update({ is_read: true })
+      .or(`user_id.eq.${userId},user_id.is.null`);
+  }
+}
+
+// --- HOLIDAYS ---
+
+export interface Holiday {
+  id?: number;
+  date: string;
+  title: string;
+  description?: string;
+  color?: string;
+  created_by?: string;
+  created_at?: string;
+}
+
+// Fetch all holidays
+export async function getHolidays(): Promise<Holiday[]> {
+  try {
+    const { data, error } = await supabase
+      .from('holidays')
+      .select('*')
+      .order('date', { ascending: true });
+
+    if (!error && data) {
+      try {
+        localStorage.setItem('hr_holidays_cache', JSON.stringify(data));
+      } catch (e) {}
+      return data as Holiday[];
+    }
+  } catch (err) {
+    console.warn('Could not fetch holidays from Supabase, checking local cache:', err);
+  }
+
+  // Fallback to local cache
+  try {
+    const raw = localStorage.getItem('hr_holidays_cache');
+    if (raw) {
+      return JSON.parse(raw) as Holiday[];
+    }
+  } catch (e) {}
+
+  return [];
+}
+
+// Create a holiday
+export async function createHoliday(holiday: Omit<Holiday, 'id' | 'created_at'>): Promise<Holiday> {
+  let created: Holiday = {
+    ...holiday,
+    id: Date.now(),
+    created_at: new Date().toISOString()
+  };
+
+  try {
+    // 1. Try full insert
+    const { data, error } = await supabase
+      .from('holidays')
+      .insert(holiday)
+      .select()
+      .single();
+
+    if (!error && data) {
+      created = data as Holiday;
+    } else if (error) {
+      // 2. Retry without color if column is missing
+      const { color, ...withoutColor } = holiday as any;
+      const { data: retryData, error: retryErr } = await supabase
+        .from('holidays')
+        .insert(withoutColor)
+        .select()
+        .single();
+      
+      if (!retryErr && retryData) {
+        created = retryData as Holiday;
+      }
+    }
+  } catch (err) {
+    console.warn('Could not insert holiday in Supabase, saving to local cache:', err);
+  }
+
+  // Update local cache
+  try {
+    const existing = await getHolidays();
+    const filtered = existing.filter(h => h.date !== holiday.date && h.id !== created.id);
+    filtered.push(created);
+    filtered.sort((a, b) => a.date.localeCompare(b.date));
+    localStorage.setItem('hr_holidays_cache', JSON.stringify(filtered));
+  } catch (e) {}
+
+  // Auto-sync leave balances for all active employees when a holiday is added
+  syncAllEmployeesLeaveBalances().catch(err => console.warn('Background leave balance sync error:', err));
+  try {
+    window.dispatchEvent(new CustomEvent('app-refresh-notifications'));
+  } catch (e) {}
+
+  return created;
+}
+
+// Delete a holiday
+export async function deleteHoliday(id: number): Promise<void> {
+  try {
+    await supabase
+      .from('holidays')
+      .delete()
+      .eq('id', id);
+  } catch (err) {
+    console.warn('Could not delete holiday from Supabase:', err);
+  }
+
+  // Update local cache
+  try {
+    const existing = await getHolidays();
+    const filtered = existing.filter(h => h.id !== id);
+    localStorage.setItem('hr_holidays_cache', JSON.stringify(filtered));
+  } catch (e) {}
+
+  // Auto-sync leave balances for all active employees when a holiday is deleted
+  syncAllEmployeesLeaveBalances().catch(err => console.warn('Background leave balance sync error:', err));
+  try {
+    window.dispatchEvent(new CustomEvent('app-refresh-notifications'));
+  } catch (e) {}
+}
+
+// Check and trigger birthday notifications
+export async function checkAndTriggerBirthdayNotifications(): Promise<void> {
+  const { data: profiles, error: pError } = await supabase
+    .from('profiles')
+    .select('full_name, date_of_birth')
+    .eq('is_active', true);
+
+  if (pError || !profiles) return;
+
+  const today = new Date();
+  const todayMonth = today.getMonth(); // 0-11
+  const todayDay = today.getDate(); // 1-31
+
+  const birthdayPeople = profiles.filter(p => {
+    if (!p.date_of_birth) return false;
+    const dob = new Date(p.date_of_birth + 'T00:00:00');
+    return dob.getMonth() === todayMonth && dob.getDate() === todayDay;
+  });
+
+  if (birthdayPeople.length === 0) return;
+
+  // Start of today in UTC/ISO
+  const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const todayStartStr = todayStart.toLocaleDateString('en-CA') + 'T00:00:00.000Z';
+
+  const { data: existingNotifs, error: nError } = await supabase
+    .from('notifications')
+    .select('message')
+    .eq('title', 'Birthday Today')
+    .gte('created_at', todayStartStr);
+
+  if (nError) return;
+
+  for (const person of birthdayPeople) {
+    const msg = `Happy Birthday to ${person.full_name}!`;
+    const alreadySent = (existingNotifs || []).some(n => n.message === msg);
+
+    if (!alreadySent) {
+      await createNotification({
+        user_id: null,
+        title: 'Birthday Today',
+        message: msg
+      });
+    }
+  }
+}
+
+// --- DEVICE SETTINGS ---
+
+export interface DeviceSettings {
+  id?: number;
+  ip_address: string;
+  port: number;
+  sync_interval: number;
+  last_sync?: string | null;
+  status?: string;
+  last_connection_state?: string;
+  grace_time_mins?: number;
+  monthly_grace_settings?: Record<string, number>;
+  default_shift_start_time?: string;
+  default_shift_end_time?: string;
+  default_shift_total_hours?: number;
+  is_notifications_muted?: boolean;
+  auto_backup_enabled?: boolean;
+  backup_directory?: string;
+  last_backup_time?: string | null;
+  hr_contact_phone?: string;
+  hr_contact_email?: string;
+  updated_at?: string;
+}
+
+// Fetch device settings from Supabase (with multi-device localStorage fallback & sync)
+export async function getDeviceSettings(): Promise<DeviceSettings> {
+  let dbResult: DeviceSettings | null = null;
+  try {
+    const { data, error } = await supabase
+      .from('device_settings')
+      .select('*')
+      .eq('id', 1)
+      .maybeSingle();
+
+    if (!error && data) {
+      dbResult = data as DeviceSettings;
+    }
+  } catch (err) {}
+
+  let globalTiming: ShiftTiming | null = null;
+  try {
+    const { data } = await supabase
+      .from('shift_timings')
+      .select('*')
+      .eq('target_type', 'department')
+      .eq('target_id', 'GLOBAL_DEFAULT_SETTINGS')
+      .maybeSingle();
+    if (data) globalTiming = data as ShiftTiming;
+  } catch (e) {}
+
+  let tagGraceMins: number | null = null;
+  let tagMonthlyGrace: Record<string, number> | null = null;
+  let tagMuted: boolean | null = null;
+  if (globalTiming?.target_name) {
+    const matchGrace = globalTiming.target_name.match(/\[GRACE:(\d+)\]/);
+    if (matchGrace) tagGraceMins = parseInt(matchGrace[1], 10);
+
+    const matchMonthly = globalTiming.target_name.match(/\[MONTHLY:(\{.*?\})\]/);
+    if (matchMonthly) {
+      try {
+        tagMonthlyGrace = JSON.parse(matchMonthly[1]);
+      } catch (e) {}
+    }
+
+    const matchMuted = globalTiming.target_name.match(/\[MUTED:(true|false)\]/);
+    if (matchMuted) tagMuted = matchMuted[1] === 'true';
+  }
+
+  let tokenMuted: boolean | null = null;
+  try {
+    const { data: tokenRecord } = await supabase
+      .from('user_push_tokens')
+      .select('subscription_data')
+      .eq('token', 'SYSTEM_CONFIG_MUTE_NOTIFICATIONS')
+      .maybeSingle();
+    if (tokenRecord && tokenRecord.subscription_data) {
+      const parsed = typeof tokenRecord.subscription_data === 'string' 
+        ? JSON.parse(tokenRecord.subscription_data) 
+        : tokenRecord.subscription_data;
+      if (typeof parsed.is_notifications_muted === 'boolean') {
+        tokenMuted = parsed.is_notifications_muted;
+      }
+    }
+  } catch (e) {}
+
+  let tokenHrContact: { phone?: string; email?: string } | null = null;
+  try {
+    const { data: hrTokenRecord } = await supabase
+      .from('user_push_tokens')
+      .select('subscription_data')
+      .eq('token', 'SYSTEM_CONFIG_HR_CONTACT')
+      .maybeSingle();
+    if (hrTokenRecord && hrTokenRecord.subscription_data) {
+      const parsed = typeof hrTokenRecord.subscription_data === 'string'
+        ? JSON.parse(hrTokenRecord.subscription_data)
+        : hrTokenRecord.subscription_data;
+      if (parsed) {
+        tokenHrContact = parsed;
+      }
+    }
+  } catch (e) {}
+
+  let localSettings: Partial<DeviceSettings> = {};
+  try {
+    const raw = localStorage.getItem('device_settings');
+    if (raw) localSettings = JSON.parse(raw);
+  } catch (err) {}
+
+  const localGrace = localStorage.getItem('office_grace_time_mins');
+  const localMonthlyGrace = localStorage.getItem('monthly_grace_settings');
+  const localStart = localStorage.getItem('office_default_shift_start');
+  const localEnd = localStorage.getItem('office_default_shift_end');
+  const localHours = localStorage.getItem('office_default_shift_hours');
+  const localMuted = localStorage.getItem('is_notifications_muted');
+  const localAutoBackup = localStorage.getItem('auto_backup_enabled');
+  const localBackupDir = localStorage.getItem('backup_directory');
+  const localHrPhone = localStorage.getItem('hr_contact_phone');
+  const localHrEmail = localStorage.getItem('hr_contact_email');
+
+  const graceMins = dbResult?.grace_time_mins ?? globalTiming?.grace_mins ?? tagGraceMins ?? localSettings.grace_time_mins ?? (localGrace ? parseInt(localGrace, 10) : 20);
+  const monthlyGrace = dbResult?.monthly_grace_settings ?? tagMonthlyGrace ?? localSettings.monthly_grace_settings ?? (localMonthlyGrace ? JSON.parse(localMonthlyGrace) : {});
+  const defaultStart = dbResult?.default_shift_start_time ?? (globalTiming?.start_time ? String(globalTiming.start_time).substring(0, 5) : null) ?? localSettings.default_shift_start_time ?? (localStart || '11:00');
+  const defaultEnd = dbResult?.default_shift_end_time ?? (globalTiming?.end_time ? String(globalTiming.end_time).substring(0, 5) : null) ?? localSettings.default_shift_end_time ?? (localEnd || '20:00');
+  const defaultHours = dbResult?.default_shift_total_hours ?? (globalTiming?.total_hours ? Number(globalTiming.total_hours) : null) ?? localSettings.default_shift_total_hours ?? (localHours ? parseFloat(localHours) : 9);
+  const isMuted = tokenMuted ?? dbResult?.is_notifications_muted ?? tagMuted ?? localSettings.is_notifications_muted ?? (localMuted === 'true');
+  const autoBackup = dbResult?.auto_backup_enabled ?? localSettings.auto_backup_enabled ?? (localAutoBackup === 'true');
+  const backupDir = dbResult?.backup_directory || localSettings.backup_directory || localBackupDir || 'D:\\Elipse\\HRPortal\\backups';
+  const lastBackup = dbResult?.last_backup_time || localSettings.last_backup_time || null;
+  const hrPhone = tokenHrContact?.phone || (dbResult as any)?.hr_contact_phone || localSettings.hr_contact_phone || localHrPhone || '+92 300 1234567';
+  const hrEmail = tokenHrContact?.email || (dbResult as any)?.hr_contact_email || localSettings.hr_contact_email || localHrEmail || 'hr@elipsestudio.com';
+
+  return {
+    id: 1,
+    ip_address: dbResult?.ip_address || localSettings.ip_address || '192.168.1.201',
+    port: dbResult?.port || localSettings.port || 4370,
+    sync_interval: dbResult?.sync_interval || localSettings.sync_interval || 1,
+    status: dbResult?.status || localSettings.status || 'Offline',
+    last_connection_state: dbResult?.last_connection_state || localSettings.last_connection_state || 'Unknown',
+    grace_time_mins: graceMins,
+    monthly_grace_settings: monthlyGrace,
+    default_shift_start_time: defaultStart,
+    default_shift_end_time: defaultEnd,
+    default_shift_total_hours: defaultHours,
+    is_notifications_muted: isMuted,
+    auto_backup_enabled: autoBackup,
+    backup_directory: backupDir,
+    last_backup_time: lastBackup || undefined,
+    hr_contact_phone: hrPhone,
+    hr_contact_email: hrEmail
+  };
+}
+
+// Update device settings in Supabase (with fallback to localStorage for offline devices)
+export async function updateDeviceSettings(settings: Partial<DeviceSettings>): Promise<void> {
+  // 1. Persist notification mute configuration to cloud database with open upsert permissions
+  if (settings.is_notifications_muted !== undefined) {
+    try {
+      await supabase
+        .from('user_push_tokens')
+        .upsert({
+          user_id: 'SYSTEM_CONFIG',
+          email: 'system@elipse.local',
+          role: 'system',
+          token: 'SYSTEM_CONFIG_MUTE_NOTIFICATIONS',
+          subscription_data: JSON.stringify({ is_notifications_muted: settings.is_notifications_muted }),
+          device_info: 'SYSTEM_MUTE_RECORD',
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'token' });
+    } catch (muteErr) {}
+  }
+
+  // 1b. Persist Admin / HR Contact information to cloud and localStorage
+  if (settings.hr_contact_phone !== undefined || settings.hr_contact_email !== undefined) {
+    if (settings.hr_contact_phone !== undefined) localStorage.setItem('hr_contact_phone', settings.hr_contact_phone);
+    if (settings.hr_contact_email !== undefined) localStorage.setItem('hr_contact_email', settings.hr_contact_email);
+    try {
+      await supabase
+        .from('user_push_tokens')
+        .upsert({
+          user_id: 'SYSTEM_CONFIG',
+          email: 'system@elipse.local',
+          role: 'system',
+          token: 'SYSTEM_CONFIG_HR_CONTACT',
+          subscription_data: JSON.stringify({
+            phone: settings.hr_contact_phone,
+            email: settings.hr_contact_email
+          }),
+          device_info: 'SYSTEM_HR_CONTACT_RECORD',
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'token' });
+    } catch (e) {}
+  }
+
+  // 2. Try updating device_settings table (full payload if columns exist, base fields fallback)
+  const fullPayload = { id: 1, ...settings, updated_at: new Date().toISOString() };
+  try {
+    const { error } = await supabase.from('device_settings').upsert([fullPayload]);
+    if (error) {
+      const baseData: any = { id: 1, updated_at: new Date().toISOString() };
+      if (settings.ip_address !== undefined) baseData.ip_address = settings.ip_address;
+      if (settings.port !== undefined) baseData.port = settings.port;
+      if (settings.sync_interval !== undefined) baseData.sync_interval = settings.sync_interval;
+      if (settings.status !== undefined) baseData.status = settings.status;
+      if (settings.last_connection_state !== undefined) baseData.last_connection_state = settings.last_connection_state;
+      await supabase.from('device_settings').upsert([baseData]);
+    }
+  } catch (err) {}
+
+  // 3. Save global default shift & grace settings to shift_timings
+  try {
+    const { data: existingGlobal } = await supabase
+      .from('shift_timings')
+      .select('*')
+      .eq('target_type', 'department')
+      .eq('target_id', 'GLOBAL_DEFAULT_SETTINGS')
+      .maybeSingle();
+
+    const isMutedVal = settings.is_notifications_muted !== undefined 
+      ? settings.is_notifications_muted 
+      : (localStorage.getItem('is_notifications_muted') === 'true');
+
+    const tagStr = `[GRACE:${settings.grace_time_mins || 20}][MONTHLY:${JSON.stringify(settings.monthly_grace_settings || {})}][MUTED:${isMutedVal ? 'true' : 'false'}]`;
+    const globalRule: Partial<ShiftTiming> = {
+      target_type: 'department',
+      target_id: 'GLOBAL_DEFAULT_SETTINGS',
+      target_name: `Global Default Settings ${tagStr}`,
+      start_time: settings.default_shift_start_time || '11:00',
+      end_time: settings.default_shift_end_time || '20:00',
+      grace_mins: settings.grace_time_mins || 20,
+      is_fixed_hours: true,
+      total_hours: settings.default_shift_total_hours || 9,
+      days: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'],
+      allow_regular_overtime: true
+    };
+    if (existingGlobal?.id) {
+      globalRule.id = existingGlobal.id;
+    }
+    await saveShiftTiming(globalRule as ShiftTiming);
+  } catch (e) {}
+
+  try {
+    const raw = localStorage.getItem('device_settings');
+    const prev = raw ? JSON.parse(raw) : {};
+    const merged = { ...prev, ...settings, id: 1 };
+    localStorage.setItem('device_settings', JSON.stringify(merged));
+    if (settings.grace_time_mins !== undefined) {
+      localStorage.setItem('office_grace_time_mins', settings.grace_time_mins.toString());
+    }
+    if (settings.monthly_grace_settings) {
+      localStorage.setItem('monthly_grace_settings', JSON.stringify(settings.monthly_grace_settings));
+    }
+    if (settings.default_shift_start_time) {
+      localStorage.setItem('office_default_shift_start', settings.default_shift_start_time);
+    }
+    if (settings.default_shift_end_time) {
+      localStorage.setItem('office_default_shift_end', settings.default_shift_end_time);
+    }
+    if (settings.default_shift_total_hours !== undefined) {
+      localStorage.setItem('office_default_shift_hours', settings.default_shift_total_hours.toString());
+    }
+    if (settings.is_notifications_muted !== undefined) {
+      localStorage.setItem('is_notifications_muted', settings.is_notifications_muted ? 'true' : 'false');
+      try {
+        window.dispatchEvent(new CustomEvent('app-mute-notifications-changed', { detail: { isMuted: settings.is_notifications_muted } }));
+      } catch (_) {}
+    }
+    if (settings.auto_backup_enabled !== undefined) {
+      localStorage.setItem('auto_backup_enabled', settings.auto_backup_enabled ? 'true' : 'false');
+    }
+    if (settings.backup_directory) {
+      localStorage.setItem('backup_directory', settings.backup_directory);
+    }
+  } catch (e) {}
+}
+
+// --- SALARY DIVISION PLANS (DATABASE PERSISTENCE) ---
+export async function getSalaryDivisionPlans(): Promise<Record<string, any>> {
+  let plans: Record<string, any> = {};
+
+  // 1. Try fetching from dedicated salary_division_plans table in Supabase
+  try {
+    const { data, error } = await supabase
+      .from('salary_division_plans')
+      .select('*');
+
+    if (!error && data && data.length > 0) {
+      data.forEach((row: any) => {
+        if (row.month_key) {
+          plans[row.month_key] = {
+            monthKey: row.month_key,
+            divisionCount: row.division_count || (row.divisions ? row.divisions.length : 2),
+            divisions: row.divisions || []
+          };
+        }
+      });
+      return plans;
+    }
+  } catch (e) {}
+
+  // 2. Fallback: Try fetching from user_push_tokens system config record in Supabase
+  try {
+    const { data } = await supabase
+      .from('user_push_tokens')
+      .select('subscription_data')
+      .eq('token', 'SYSTEM_CONFIG_SALARY_DIVISION_PLANS')
+      .maybeSingle();
+
+    if (data && data.subscription_data) {
+      const parsed = typeof data.subscription_data === 'string'
+        ? JSON.parse(data.subscription_data)
+        : data.subscription_data;
+      if (parsed && typeof parsed === 'object') {
+        plans = { ...parsed, ...plans };
+      }
+    }
+  } catch (e) {}
+
+  // 3. Fallback / merge with local storage
+  try {
+    const raw = localStorage.getItem('salary_division_plans');
+    if (raw) {
+      const local = JSON.parse(raw);
+      if (local && typeof local === 'object') {
+        plans = { ...local, ...plans };
+      }
+    }
+  } catch (e) {}
+
+  return plans;
+}
+
+export async function saveSalaryDivisionPlans(plans: Record<string, any>): Promise<void> {
+  // 1. Save to dedicated salary_division_plans table in Supabase
+  try {
+    for (const [monthKey, plan] of Object.entries(plans)) {
+      if (monthKey && plan) {
+        await supabase
+          .from('salary_division_plans')
+          .upsert({
+            month_key: monthKey,
+            division_count: plan.divisionCount || (plan.divisions ? plan.divisions.length : 2),
+            divisions: plan.divisions || [],
+            updated_at: new Date().toISOString()
+          }, { onConflict: 'month_key' });
+      }
+    }
+  } catch (e) {}
+
+  // 2. Backup to user_push_tokens cloud record (guaranteed open RLS table)
+  try {
+    await supabase
+      .from('user_push_tokens')
+      .upsert({
+        user_id: 'SYSTEM_CONFIG',
+        email: 'system@elipse.local',
+        role: 'system',
+        token: 'SYSTEM_CONFIG_SALARY_DIVISION_PLANS',
+        subscription_data: JSON.stringify(plans),
+        device_info: 'SYSTEM_SALARY_DIVISIONS',
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'token' });
+  } catch (e) {}
+
+  // 3. Save to local storage for instant client access
+  try {
+    localStorage.setItem('salary_division_plans', JSON.stringify(plans));
+  } catch (e) {}
+}
+
+// --- EMPLOYEE OF THE MONTH NOMINEE RANKS ---
+
+export interface MonthlyNomineeRanksData {
+  monthKey: string;
+  updatedAt: string;
+  totalEmployees: number;
+  nominees: EmployeeNominee[];
+  ranksByPin: Record<string, number>;
+  ranksById: Record<string, number>;
+  totalEmployeesByPin?: Record<string, number>;
+}
+
+// Persist computed monthly employee of the month nominee rankings
+export async function saveMonthlyNomineeRanks(
+  monthKey: string,
+  data: MonthlyNomineeRanksData
+): Promise<void> {
+  if (!monthKey || !data) return;
+
+  // 1. Save to local storage for instant access
+  try {
+    localStorage.setItem(`monthly_nominee_ranks_${monthKey}`, JSON.stringify(data));
+    const allRanksRaw = localStorage.getItem('all_monthly_nominee_ranks');
+    const allRanks: Record<string, MonthlyNomineeRanksData> = allRanksRaw ? JSON.parse(allRanksRaw) : {};
+    allRanks[monthKey] = data;
+    localStorage.setItem('all_monthly_nominee_ranks', JSON.stringify(allRanks));
+  } catch (e) {}
+
+  // 2. Persist to user_push_tokens system config record in Supabase
+  try {
+    let existingAll: Record<string, MonthlyNomineeRanksData> = {};
+    try {
+      const { data: record } = await supabase
+        .from('user_push_tokens')
+        .select('subscription_data')
+        .eq('token', 'SYSTEM_CONFIG_EMPLOYEE_OF_THE_MONTH_RANKS')
+        .maybeSingle();
+      if (record && record.subscription_data) {
+        existingAll = typeof record.subscription_data === 'string'
+          ? JSON.parse(record.subscription_data)
+          : record.subscription_data;
+      }
+    } catch (readErr) {}
+
+    existingAll[monthKey] = data;
+
+    await supabase
+      .from('user_push_tokens')
+      .upsert({
+        user_id: 'SYSTEM_CONFIG',
+        email: 'system@elipse.local',
+        role: 'system',
+        token: 'SYSTEM_CONFIG_EMPLOYEE_OF_THE_MONTH_RANKS',
+        subscription_data: JSON.stringify(existingAll),
+        device_info: 'SYSTEM_NOMINEE_RANKS',
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'token' });
+  } catch (e) {}
+}
+
+// Fetch monthly employee of the month nominee rankings
+export async function getMonthlyNomineeRanks(
+  monthKey?: string
+): Promise<MonthlyNomineeRanksData | null> {
+  // If no monthKey provided, default to previous completed month
+  let targetKey = monthKey;
+  if (!targetKey) {
+    const now = new Date();
+    const prev = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const pad = (n: number) => n.toString().padStart(2, '0');
+    targetKey = `${prev.getFullYear()}-${pad(prev.getMonth() + 1)}`;
+  }
+
+  // 1. Try local storage first for 0ms render
+  try {
+    const cached = localStorage.getItem(`monthly_nominee_ranks_${targetKey}`);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (parsed && parsed.nominees) return parsed;
+    }
+  } catch (e) {}
+
+  // 2. Fetch from cloud database
+  try {
+    const { data: record } = await supabase
+      .from('user_push_tokens')
+      .select('subscription_data')
+      .eq('token', 'SYSTEM_CONFIG_EMPLOYEE_OF_THE_MONTH_RANKS')
+      .maybeSingle();
+
+    if (record && record.subscription_data) {
+      const parsedAll = typeof record.subscription_data === 'string'
+        ? JSON.parse(record.subscription_data)
+        : record.subscription_data;
+
+      if (parsedAll && parsedAll[targetKey]) {
+        const found = parsedAll[targetKey] as MonthlyNomineeRanksData;
+        try {
+          localStorage.setItem(`monthly_nominee_ranks_${targetKey}`, JSON.stringify(found));
+        } catch (e) {}
+        return found;
+      }
+    }
+  } catch (e) {}
+
+  return null;
+}
+
+// --- PURPOSE / CHARITY TRANSFERS ---
+
+export interface PurposeTransfer {
+  id?: number;
+  payee_name: string;
+  purpose: string;
+  amount: number;
+  payment_method: string;
+  bank_name?: string;
+  bank_account_title?: string;
+  bank_account_no?: string;
+  created_at?: string;
+}
+
+// Fetch all recorded purpose/charity transfers (with graceful fallback if table not created yet)
+export async function getPurposeTransfers(): Promise<PurposeTransfer[]> {
+  let list: PurposeTransfer[] = [];
+  try {
+    const { data, error } = await supabase
+      .from('purpose_transfers')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (!error && data) {
+      list = data as PurposeTransfer[];
+    }
+  } catch (err) {}
+
+  try {
+    const raw = localStorage.getItem('purpose_transfers');
+    if (raw) {
+      const local: PurposeTransfer[] = JSON.parse(raw);
+      local.forEach(item => {
+        if (!list.some(x => String(x.id) === String(item.id))) {
+          list.push(item);
+        }
+      });
+    }
+  } catch (err) {}
+
+  return list;
+}
+
+// Record a new purpose/charity transfer
+export async function createPurposeTransfer(transfer: PurposeTransfer): Promise<PurposeTransfer> {
+  let saved: PurposeTransfer = { ...transfer, id: transfer.id || Date.now() };
+  try {
+    const { data, error } = await supabase
+      .from('purpose_transfers')
+      .insert([transfer])
+      .select()
+      .single();
+
+    if (!error && data) {
+      saved = data;
+    }
+  } catch (error) {}
+
+  try {
+    const raw = localStorage.getItem('purpose_transfers');
+    let list: PurposeTransfer[] = raw ? JSON.parse(raw) : [];
+    list = list.filter(item => String(item.id) !== String(saved.id));
+    list.unshift(saved);
+    localStorage.setItem('purpose_transfers', JSON.stringify(list));
+  } catch (e) {}
+
+  return saved;
+}
+
+// Delete a purpose/charity transfer record
+export async function deletePurposeTransfer(id: number): Promise<void> {
+  try {
+    await supabase
+      .from('purpose_transfers')
+      .delete()
+      .eq('id', id);
+  } catch (e) {}
+
+  try {
+    const raw = localStorage.getItem('purpose_transfers');
+    if (raw) {
+      let list: PurposeTransfer[] = JSON.parse(raw);
+      list = list.filter(item => String(item.id) !== String(id));
+      localStorage.setItem('purpose_transfers', JSON.stringify(list));
+    }
+  } catch (e) {}
+}
+
+// Update an existing purpose/charity transfer record
+export async function updatePurposeTransfer(id: number, transfer: PurposeTransfer): Promise<PurposeTransfer> {
+  const { data, error } = await supabase
+    .from('purpose_transfers')
+    .update(transfer)
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+// --- EMPLOYEE LOANS ---
+
+export interface EmployeeLoan {
+  id?: number;
+  employee_id: string;
+  employee_pin: string;
+  employee_name?: string;
+  employee_contact?: string;
+  net_salary?: number;
+  loan_name: string;
+  loan_amount: number;
+  monthly_deduction: number;
+  months_duration?: number;
+  total_repaid?: number;
+  remaining_balance: number;
+  status: 'Pending' | 'Approved' | 'Rejected' | 'Completed';
+  notes?: string;
+  start_date?: string;
+  end_date?: string;
+  selected_months?: string[];
+  skipped_months?: string[];
+  months_skipped?: number;
+  loan_tax_mode?: 'same' | 'custom';
+  loan_tax_amount?: number;
+  deduction_basis?: 'base_salary' | 'net_salary';
+  last_payment_date?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+// Calculate dynamic effective remaining loan balance taking into account elapsed calendar months
+export function getEffectiveLoanRemaining(loan: EmployeeLoan): { remaining: number; repaid: number; status: EmployeeLoan['status'] } {
+  if (loan.status === 'Rejected') {
+    return { remaining: loan.loan_amount || 0, repaid: 0, status: 'Rejected' };
+  }
+  if (loan.status === 'Pending') {
+    return { remaining: loan.remaining_balance ?? (loan.loan_amount || 0), repaid: loan.total_repaid ?? 0, status: 'Pending' };
+  }
+
+  const loanAmt = Number(loan.loan_amount || 0);
+  const monthlyDed = Number(loan.monthly_deduction || 0);
+
+  // If already manually marked completed with 0 remaining
+  if (loan.status === 'Completed' && (loan.remaining_balance === 0 || (loan.total_repaid || 0) >= loanAmt)) {
+    return { remaining: 0, repaid: Math.max(loanAmt, loan.total_repaid || 0), status: 'Completed' };
+  }
+
+  // Determine loan start date (falling back to approval/created date for historical active loans)
+  const startDateStr = loan.start_date || (loan.status === 'Approved' ? loan.created_at : undefined);
+  let elapsedMonths = 0;
+  if (startDateStr) {
+    try {
+      const start = new Date(startDateStr);
+      const now = new Date();
+      if (!isNaN(start.getTime())) {
+        elapsedMonths = (now.getFullYear() - start.getFullYear()) * 12 + (now.getMonth() - start.getMonth());
+        if (elapsedMonths < 0) elapsedMonths = 0;
+      }
+    } catch (e) {}
+  }
+
+  // Deduct skipped months if any
+  const skippedCount = loan.months_skipped || (Array.isArray(loan.skipped_months) ? loan.skipped_months.length : 0);
+  const activeElapsedMonths = Math.max(0, elapsedMonths - skippedCount);
+  const elapsedDeductions = activeElapsedMonths * monthlyDed;
+
+  // Repaid is at least the elapsed monthly deductions or the recorded total_repaid
+  const explicitRepaid = Number(loan.total_repaid || 0);
+  const effectiveRepaid = Math.min(loanAmt, Math.max(explicitRepaid, elapsedDeductions));
+  const effectiveRemaining = Math.max(0, loanAmt - effectiveRepaid);
+
+  const status: EmployeeLoan['status'] = (effectiveRemaining === 0 && loanAmt > 0) ? 'Completed' : (loan.status || 'Approved');
+
+  return {
+    remaining: effectiveRemaining,
+    repaid: effectiveRepaid,
+    status
+  };
+}
+
+// Fetch employee loans (stored in cloud complaints table & local storage) with ultra-fast caching
+export async function getEmployeeLoans(employeeId?: string): Promise<EmployeeLoan[]> {
+  const cacheKey = employeeId ? `employee_loans_${employeeId}` : 'employee_loans';
+
+  return withCache(cacheKey, async () => {
+    let allLoans: EmployeeLoan[] = [];
+  const seenIds = new Set<string>();
+  const seenSignatures = new Set<string>();
+  let hasCloudResponse = false;
+
+  // 1. Try public.employee_loans table
+  try {
+    const { data: directData, error: directErr } = await supabase
+      .from('employee_loans')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (!directErr) {
+      hasCloudResponse = true;
+      if (directData && directData.length > 0) {
+        directData.forEach((row: any) => {
+          const uKey = `el_${row.id}`;
+          const loanSig = `${row.employee_id || row.employee_pin}_${row.loan_name}_${row.loan_amount}`.toLowerCase().replace(/\s+/g, '');
+          if (!seenIds.has(uKey) && !seenSignatures.has(loanSig)) {
+            seenIds.add(uKey);
+            seenSignatures.add(loanSig);
+            allLoans.push(row as EmployeeLoan);
+          }
+        });
+      }
+    }
+  } catch (e) {}
+
+  // 2. Also check complaints table
+  try {
+    const { data: compData, error: compErr } = await supabase
+      .from('complaints')
+      .select('*')
+      .ilike('title', '%[LOAN_REQUEST]%')
+      .order('created_at', { ascending: false });
+
+    if (!compErr) {
+      hasCloudResponse = true;
+      if (compData && compData.length > 0) {
+        compData.forEach((c: any) => {
+          let loanObj: Partial<EmployeeLoan> | null = null;
+          if (c.description) {
+            try {
+              loanObj = JSON.parse(c.description);
+            } catch (e) {}
+          }
+
+          const amt = loanObj?.loan_amount || parseFloat(String(c.title || '').match(/PKR\s*([\d,]+)/i)?.[1]?.replace(/,/g, '') || '0');
+          const dur = loanObj?.months_duration || 1;
+          const ded = loanObj?.monthly_deduction || (amt > 0 ? Math.round(amt / dur) : 0);
+
+          let statusMapped: EmployeeLoan['status'] = 'Pending';
+          if (loanObj?.status) {
+            statusMapped = loanObj.status;
+          } else if (c.status === 'Resolved') {
+            statusMapped = 'Approved';
+          } else if (c.status === 'Closed') {
+            statusMapped = 'Rejected';
+          }
+
+          const reconstructedLoan: EmployeeLoan = {
+            id: c.id,
+            employee_id: String(c.employee_id || ''),
+            employee_pin: String(loanObj?.employee_pin || c.employee_id || ''),
+            employee_name: loanObj?.employee_name || 'Employee',
+            employee_contact: loanObj?.employee_contact || undefined,
+            loan_name: loanObj?.loan_name || String(c.title || '').replace(/\[LOAN_REQUEST\]\s*/i, '').split('(')[0].trim() || 'Loan Request',
+            loan_amount: amt,
+            monthly_deduction: ded,
+            months_duration: dur,
+            total_repaid: loanObj?.total_repaid || 0,
+            remaining_balance: loanObj?.remaining_balance !== undefined ? loanObj.remaining_balance : amt,
+            status: statusMapped,
+            notes: loanObj?.notes || '',
+            start_date: loanObj?.start_date,
+            end_date: loanObj?.end_date,
+            selected_months: loanObj?.selected_months,
+            skipped_months: loanObj?.skipped_months,
+            months_skipped: loanObj?.months_skipped,
+            loan_tax_mode: loanObj?.loan_tax_mode,
+            loan_tax_amount: loanObj?.loan_tax_amount !== undefined && loanObj?.loan_tax_amount !== null ? Number(loanObj.loan_tax_amount) : undefined,
+            deduction_basis: loanObj?.deduction_basis || 'net_salary',
+            last_payment_date: loanObj?.last_payment_date,
+            created_at: c.created_at,
+            updated_at: c.updated_at || c.created_at
+          };
+
+          const uKey = `comp_${c.id}`;
+          const loanSig = `${reconstructedLoan.employee_id || reconstructedLoan.employee_pin}_${reconstructedLoan.loan_name}_${reconstructedLoan.loan_amount}`.toLowerCase().replace(/\s+/g, '');
+          if (!seenIds.has(uKey) && !seenSignatures.has(loanSig)) {
+            seenIds.add(uKey);
+            seenSignatures.add(loanSig);
+            allLoans.push(reconstructedLoan);
+          } else {
+            // Merge custom tax and schedule details if existing record lacked them
+            const existing = allLoans.find(l => `${l.employee_id || l.employee_pin}_${l.loan_name}_${l.loan_amount}`.toLowerCase().replace(/\s+/g, '') === loanSig);
+            if (existing) {
+              if (existing.loan_tax_mode === undefined && reconstructedLoan.loan_tax_mode !== undefined) {
+                existing.loan_tax_mode = reconstructedLoan.loan_tax_mode;
+              }
+              if (existing.loan_tax_amount === undefined && reconstructedLoan.loan_tax_amount !== undefined) {
+                existing.loan_tax_amount = reconstructedLoan.loan_tax_amount;
+              }
+              if (!existing.selected_months && reconstructedLoan.selected_months) {
+                existing.selected_months = reconstructedLoan.selected_months;
+              }
+              if (!existing.skipped_months && reconstructedLoan.skipped_months) {
+                existing.skipped_months = reconstructedLoan.skipped_months;
+              }
+              if (!existing.deduction_basis && reconstructedLoan.deduction_basis) {
+                existing.deduction_basis = reconstructedLoan.deduction_basis;
+              }
+            }
+          }
+        });
+      }
+    }
+  } catch (e) {}
+
+  // Dynamically compute effective remaining balance & repayments taking elapsed months into account
+  allLoans.forEach(loan => {
+    const effective = getEffectiveLoanRemaining(loan);
+    loan.remaining_balance = effective.remaining;
+    loan.total_repaid = effective.repaid;
+    if (loan.status === 'Approved' && effective.status === 'Completed') {
+      loan.status = 'Completed';
+    }
+  });
+
+  // Sync to localStorage
+  try {
+    if (hasCloudResponse) {
+      if (allLoans.length > 0) {
+        localStorage.setItem('employee_loans', JSON.stringify(allLoans));
+      } else {
+        // Cloud is empty (records were deleted in DB), so remove stale local storage cache!
+        localStorage.removeItem('employee_loans');
+      }
+    } else {
+      const raw = localStorage.getItem('employee_loans');
+      if (raw) {
+        const parsed: EmployeeLoan[] = JSON.parse(raw);
+        allLoans = parsed;
+        allLoans.forEach(loan => {
+          const effective = getEffectiveLoanRemaining(loan);
+          loan.remaining_balance = effective.remaining;
+          loan.total_repaid = effective.repaid;
+          if (loan.status === 'Approved' && effective.status === 'Completed') {
+            loan.status = 'Completed';
+          }
+        });
+      }
+    }
+  } catch (e) {}
+
+  if (employeeId) {
+    return allLoans.filter(l => matchPin(l.employee_id, employeeId) || matchPin(l.employee_pin, employeeId));
+  }
+
+  return allLoans;
+  });
+}
+
+// Create a loan request (saves to complaints cloud table & localStorage)
+export async function createEmployeeLoan(loan: Omit<EmployeeLoan, 'id' | 'created_at' | 'updated_at'>): Promise<EmployeeLoan> {
+  const tempId = Date.now();
+  let createdLoan: EmployeeLoan = {
+    ...loan,
+    id: tempId,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  // Primary: Save to complaints table as cloud storage
+  try {
+    const payload = { ...createdLoan, ...loan };
+    const { data: compRes, error: compErr } = await supabase
+      .from('complaints')
+      .insert([{
+        employee_id: loan.employee_id,
+        title: `[LOAN_REQUEST] ${loan.loan_name} (PKR ${loan.loan_amount.toLocaleString()})`,
+        description: JSON.stringify(payload),
+        status: 'Open'
+      }])
+      .select()
+      .single();
+
+    if (!compErr && compRes && compRes.id) {
+      createdLoan.id = compRes.id;
+      // Update description with correct id
+      payload.id = compRes.id;
+      await supabase.from('complaints').update({ description: JSON.stringify(payload) }).eq('id', compRes.id);
+    }
+  } catch (e) {}
+
+  // Dual-write to public.employee_loans table if it exists
+  try {
+    const loanPayload: any = {
+      employee_id: loan.employee_id,
+      employee_pin: loan.employee_pin,
+      employee_name: loan.employee_name,
+      employee_contact: loan.employee_contact,
+      loan_name: loan.loan_name,
+      loan_amount: loan.loan_amount,
+      monthly_deduction: loan.monthly_deduction,
+      months_duration: loan.months_duration,
+      total_repaid: loan.total_repaid || 0,
+      remaining_balance: loan.remaining_balance,
+      status: loan.status || 'Pending',
+      notes: loan.notes,
+      start_date: loan.start_date,
+      end_date: loan.end_date,
+      selected_months: loan.selected_months,
+      skipped_months: loan.skipped_months,
+      months_skipped: loan.months_skipped || 0,
+      loan_tax_mode: loan.loan_tax_mode,
+      loan_tax_amount: loan.loan_tax_amount !== undefined && loan.loan_tax_amount !== null ? Number(loan.loan_tax_amount) : undefined,
+      deduction_basis: loan.deduction_basis,
+      last_payment_date: loan.last_payment_date
+    };
+    Object.keys(loanPayload).forEach(k => loanPayload[k] === undefined && delete loanPayload[k]);
+    const { data: elRes } = await supabase.from('employee_loans').insert([loanPayload]).select().maybeSingle();
+    if (elRes && elRes.id) {
+      createdLoan.id = elRes.id;
+    }
+  } catch (e) {}
+
+  // Sync to localStorage
+  try {
+    const raw = localStorage.getItem('employee_loans');
+    let list: EmployeeLoan[] = raw ? JSON.parse(raw) : [];
+    const sig = `${createdLoan.employee_id || createdLoan.employee_pin}_${createdLoan.loan_name}_${createdLoan.loan_amount}`.toLowerCase().replace(/\s+/g, '');
+    list = list.filter(l => `${l.employee_id || l.employee_pin}_${l.loan_name}_${l.loan_amount}`.toLowerCase().replace(/\s+/g, '') !== sig);
+    list.unshift(createdLoan);
+    localStorage.setItem('employee_loans', JSON.stringify(list));
+  } catch (e) {}
+
+  // Invalidate cache immediately
+  invalidateCache('employee_loans');
+  if (loan.employee_id) invalidateCache(`employee_loans_${loan.employee_id}`);
+
+  // Record audit log
+  recordAuditChange({
+    action: 'create',
+    entity: 'Loan',
+    targetId: createdLoan.id || tempId,
+    targetName: `${loan.employee_name || 'Employee'} - ${loan.loan_name} (PKR ${loan.loan_amount.toLocaleString()})`,
+    userId: loan.employee_id,
+    userPin: loan.employee_pin,
+    userName: loan.employee_name,
+    newData: createdLoan,
+    status: 'saved',
+    table: 'employee_loans'
+  });
+
+  try {
+    await createNotification({
+      user_id: 'admin',
+      title: `New Loan Request - ${loan.employee_name || 'Employee'}`,
+      message: `${loan.employee_name || 'Employee'} (PIN: ${loan.employee_pin || 'N/A'}) requested PKR ${Number(loan.loan_amount).toLocaleString()} (${loan.loan_name || 'Loan'}) for ${loan.months_duration || 12} months.`
+    });
+  } catch (e) {}
+
+  return createdLoan;
+}
+
+// Update loan status or details (Approve, Modify, Revert, Reject)
+export async function updateEmployeeLoan(id: number, updates: Partial<EmployeeLoan>): Promise<EmployeeLoan> {
+  const updatePayload = {
+    ...updates,
+    updated_at: new Date().toISOString()
+  };
+
+  let updated: EmployeeLoan | null = null;
+  let existingPayload: any = {};
+
+  // Primary: Update complaints cloud table
+  try {
+    const compStatus = (updates.status === 'Approved' || updates.status === 'Completed') ? 'Resolved' : updates.status === 'Rejected' ? 'Closed' : 'Open';
+    const { data: comp } = await supabase.from('complaints').select('*').eq('id', id).single();
+    if (comp?.description) {
+      try { existingPayload = JSON.parse(comp.description); } catch (e) {}
+    }
+
+    const merged = { ...existingPayload, ...updates, id, updated_at: new Date().toISOString() };
+    const { error: updErr } = await supabase
+      .from('complaints')
+      .update({
+        status: compStatus,
+        description: JSON.stringify(merged)
+      })
+      .eq('id', id);
+
+    if (!updErr) {
+      updated = merged as EmployeeLoan;
+    }
+  } catch (e) {}
+
+  // Dual-write to public.employee_loans table if it exists
+  try {
+    const loanToSync: any = updated || updates;
+    const cleanPayload: any = {
+      employee_id: loanToSync.employee_id,
+      employee_pin: loanToSync.employee_pin,
+      employee_name: loanToSync.employee_name,
+      employee_contact: loanToSync.employee_contact,
+      loan_name: loanToSync.loan_name,
+      loan_amount: loanToSync.loan_amount,
+      monthly_deduction: loanToSync.monthly_deduction,
+      months_duration: loanToSync.months_duration,
+      total_repaid: loanToSync.total_repaid,
+      remaining_balance: loanToSync.remaining_balance,
+      status: loanToSync.status,
+      notes: loanToSync.notes,
+      start_date: loanToSync.start_date,
+      end_date: loanToSync.end_date,
+      selected_months: loanToSync.selected_months,
+      skipped_months: loanToSync.skipped_months,
+      months_skipped: loanToSync.months_skipped,
+      loan_tax_mode: loanToSync.loan_tax_mode,
+      loan_tax_amount: loanToSync.loan_tax_amount !== undefined && loanToSync.loan_tax_amount !== null ? Number(loanToSync.loan_tax_amount) : undefined,
+      deduction_basis: loanToSync.deduction_basis,
+      last_payment_date: loanToSync.last_payment_date,
+      updated_at: new Date().toISOString()
+    };
+    Object.keys(cleanPayload).forEach(k => cleanPayload[k] === undefined && delete cleanPayload[k]);
+    await supabase.from('employee_loans').update(cleanPayload).eq('id', id);
+  } catch (e) {}
+
+  // Sync to localStorage
+  try {
+    const raw = localStorage.getItem('employee_loans');
+    let list: EmployeeLoan[] = raw ? JSON.parse(raw) : [];
+    const idx = list.findIndex(l => l.id === id);
+    if (idx !== -1) {
+      list[idx] = { ...list[idx], ...updatePayload };
+      if (!updated) updated = list[idx];
+      localStorage.setItem('employee_loans', JSON.stringify(list));
+    }
+  } catch (e) {}
+
+  if (updated && updates.status && updates.status !== 'Pending') {
+    try {
+      await createNotification({
+        user_id: updated.employee_id,
+        title: `Loan Request ${updates.status} - ${updated.loan_name || 'Loan'}`,
+        message: `Your loan request for PKR ${Number(updated.loan_amount).toLocaleString()} has been ${updates.status.toLowerCase()} by Management.`
+      });
+    } catch (e) {}
+  }
+
+  // Invalidate cache immediately
+  invalidateCache('employee_loans');
+  if (updated?.employee_id) invalidateCache(`employee_loans_${updated.employee_id}`);
+
+  // Record audit log
+  recordAuditChange({
+    action: 'update',
+    entity: 'Loan',
+    targetId: id,
+    targetName: `${updated?.employee_name || 'Employee'} - ${updated?.loan_name || 'Loan'} (${updates.status || 'Updated'})`,
+    userId: updated?.employee_id,
+    userPin: updated?.employee_pin,
+    userName: updated?.employee_name,
+    previousData: existingPayload,
+    newData: updated || { id, ...updatePayload },
+    status: 'saved',
+    table: 'employee_loans'
+  });
+
+  return updated || ({ id, ...updatePayload } as EmployeeLoan);
+}
+
+// Delete a loan request permanently (cross-deletes from both employee_loans and complaints in 1 click)
+export async function deleteEmployeeLoan(id: number, loan?: Partial<EmployeeLoan>): Promise<void> {
+  let empId = loan?.employee_id;
+  let lName = loan?.loan_name;
+  let lAmt = loan?.loan_amount;
+
+  // If loan details not passed, retrieve from local storage or cloud to find matching twin
+  if (!empId || !lName) {
+    try {
+      const raw = localStorage.getItem('employee_loans');
+      if (raw) {
+        const list: EmployeeLoan[] = JSON.parse(raw);
+        const match = list.find(l => l.id === id);
+        if (match) {
+          empId = match.employee_id;
+          lName = match.loan_name;
+          lAmt = match.loan_amount;
+        }
+      }
+    } catch (e) {}
+  }
+
+  // 1. Delete by ID in both tables
+  try {
+    await supabase.from('complaints').delete().eq('id', id);
+  } catch (e) {}
+
+  try {
+    await supabase.from('employee_loans').delete().eq('id', id);
+  } catch (e) {}
+
+  // 2. Cross-delete matching twin record in both tables
+  if (empId && lName) {
+    try {
+      await supabase
+        .from('employee_loans')
+        .delete()
+        .eq('employee_id', empId)
+        .eq('loan_name', lName);
+    } catch (e) {}
+
+    try {
+      await supabase
+        .from('complaints')
+        .delete()
+        .eq('employee_id', empId)
+        .ilike('title', `%${lName}%`);
+    } catch (e) {}
+  }
+
+  // 3. Clean localStorage
+  try {
+    const raw = localStorage.getItem('employee_loans');
+    if (raw) {
+      let list: EmployeeLoan[] = JSON.parse(raw);
+      list = list.filter(l => l.id !== id);
+      if (empId && lName) {
+        const sig = `${empId}_${lName}_${lAmt || ''}`.toLowerCase().replace(/\s+/g, '');
+        list = list.filter(l => `${l.employee_id || l.employee_pin}_${l.loan_name}_${l.loan_amount || ''}`.toLowerCase().replace(/\s+/g, '') !== sig);
+      }
+      localStorage.setItem('employee_loans', JSON.stringify(list));
+    }
+  } catch (e) {}
+
+  // Invalidate cache immediately
+  invalidateCache('employee_loans');
+  if (empId) invalidateCache(`employee_loans_${empId}`);
+
+  // Record audit log
+  recordAuditChange({
+    action: 'delete',
+    entity: 'Loan',
+    targetId: id,
+    targetName: `${lName || 'Loan'} (PKR ${lAmt ? Number(lAmt).toLocaleString() : 0})`,
+    userId: empId,
+    status: 'saved',
+    table: 'employee_loans'
+  });
+}
+
+// Record a monthly loan payment
+export async function recordLoanPayment(id: number, amount: number, loan: EmployeeLoan): Promise<EmployeeLoan> {
+  const newRepaid = (loan.total_repaid || 0) + amount;
+  const newRemaining = Math.max(0, loan.loan_amount - newRepaid);
+  const newStatus: EmployeeLoan['status'] = newRemaining <= 0 ? 'Completed' : 'Approved';
+
+  return updateEmployeeLoan(id, {
+    total_repaid: parseFloat(newRepaid.toFixed(2)),
+    remaining_balance: parseFloat(newRemaining.toFixed(2)),
+    last_payment_date: new Date().toISOString(),
+    status: newStatus
+  });
+}
+
+// Skip loan deduction for the current month
+export async function skipLoanMonth(id: number, loan: EmployeeLoan): Promise<EmployeeLoan> {
+  const newSkipped = (loan.months_skipped || 0) + 1;
+  let newEndDate = loan.end_date;
+  if (newEndDate) {
+    const d = new Date(newEndDate);
+    d.setMonth(d.getMonth() + 1);
+    newEndDate = d.toISOString();
+  }
+
+  return updateEmployeeLoan(id, {
+    months_skipped: newSkipped,
+    end_date: newEndDate
+  });
+}
+
+// Mark loan as fully completed and clear all remaining dues
+export async function completeEmployeeLoan(id: number, loan: EmployeeLoan): Promise<EmployeeLoan> {
+  return updateEmployeeLoan(id, {
+    status: 'Completed',
+    remaining_balance: 0,
+    total_repaid: loan.loan_amount,
+    last_payment_date: new Date().toISOString()
+  });
+}
+

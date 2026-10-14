@@ -1,0 +1,51 @@
+{
+  "name": "elipse-hr-portal-windows",
+  "productName": "Elipse HR Portal",
+  "description": "Elipse HR Management & Attendance Desktop Application",
+  "version": "1.0.0",
+  "private": true,
+  "main": "electron/main.cjs",
+  "author": "Elipse HR",
+  "scripts": {
+    "start": "electron .",
+    "build:exe": "electron-builder --win"
+  },
+  "build": {
+    "electronVersion": "34.0.0",
+    "appId": "com.elipse.hrportal",
+    "productName": "Elipse HR Portal",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "public/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Elipse HR Portal"
+    }
+  }
+}

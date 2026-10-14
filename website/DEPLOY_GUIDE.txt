@@ -1,0 +1,47 @@
+================================================================================
+                    ELIPSE HR PORTAL - WEBSITE HOSTING GUIDE
+================================================================================
+
+YES, the website is 100% PRODUCTION-READY FOR HOSTING!
+The compiled, optimized web files are located in: website/dist
+
+It connects directly to your Supabase cloud database via HTTPS & WebSockets.
+NO Node.js server is needed to host the website—any static web hosting works!
+
+--------------------------------------------------------------------------------
+OPTION 1: VERCEL (RECOMMENDED - 1-CLICK FREE HOSTING)
+--------------------------------------------------------------------------------
+1. Install Vercel CLI (or connect your GitHub repository to vercel.com):
+   npm i -g vercel
+2. Inside the "website" directory, simply run:
+   vercel --prod
+3. Your website is instantly live with free HTTPS and global CDN!
+
+--------------------------------------------------------------------------------
+OPTION 2: NETLIFY (DRAG & DROP - 10 SECONDS)
+--------------------------------------------------------------------------------
+1. Go to https://app.netlify.com/drop
+2. Drag and drop the "website/dist" folder into the browser window.
+3. Your website is deployed and live immediately!
+*(The included "_redirects" file automatically handles all page routing).*
+
+--------------------------------------------------------------------------------
+OPTION 3: cPANEL / APACHE / SHARED WEB HOSTING
+--------------------------------------------------------------------------------
+1. Open your cPanel File Manager -> "public_html" (or your subdomain folder).
+2. Upload and extract all files from "website/dist" directly into "public_html".
+*(The included ".htaccess" file automatically handles routing and rewrites).*
+
+--------------------------------------------------------------------------------
+OPTION 4: CLOUDFLARE PAGES / FIREBASE HOSTING
+--------------------------------------------------------------------------------
+- Output / Publish directory: "dist"
+- Framework: Vite
+
+--------------------------------------------------------------------------------
+LOCAL PREVIEW (BEFORE HOSTING)
+--------------------------------------------------------------------------------
+To test and preview the website on your computer right now:
+Double-click: "PREVIEW_WEBSITE.cmd" inside this folder!
+It will open http://localhost:4173 in your default browser.
+================================================================================
